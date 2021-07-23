@@ -3,6 +3,8 @@
 //
 
 #include <string>
+#include <random>
+#include <unistd.h>
 
 /**
  * Checks if a string ends with the given suffix. Returns true if it does, false otherwise.
@@ -20,3 +22,31 @@ bool endsWith(const std::string& fullString, const std::string& suffix)
     }
     return false;
 }
+
+/**
+ * Generates a random alphanumeric ID for a container. The ID is
+ * a string whose default length is 12.
+ * Implementation based on:
+ * https://stackoverflow.com/questions/440133/how-do-i-create-a-random-alpha-numeric-string-in-c
+ *
+ * @return: a randomly generated container ID with the given length;
+ */
+std::string generateContainerId(size_t length)
+{
+    std::string randomId;
+    randomId.reserve(length);
+
+    static const char charset[] =
+            "0123456789"
+            "abcdefghijklmnopqrstuvwxyz";
+
+    std::random_device rd;  // Will be used to obtain a seed for the random number engine
+    std::mt19937 gen(rd()); // Standard mersenne_twister_engine seeded with rd()
+    std::uniform_int_distribution<> pick(0, sizeof(charset) - 2);
+
+    for (int i = 0; i < length; i++)
+        randomId += charset[pick(gen)];
+
+    return randomId;
+}
+

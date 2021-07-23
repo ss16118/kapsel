@@ -7,4 +7,6 @@
 
 bool endsWith(const std::string& fullString, const std::string& suffix);
 
+std::string generateContainerId(size_t length = 12);
+
 #endif //CONTAINER_CPP_UTILS_H

@@ -1,60 +1,36 @@
 #include <iostream>
 #include <vector>
 #include <unistd.h>
-#include <sys/wait.h>
 #include <string>
-#include "command_types.h"
+#include <filesystem>
+#include <cxxopts/cxxopts.hpp>
+#include <wait.h>
+
+#include "container.h"
+#include "constants.h"
 #include "utils.h"
 
 std::map<std::string, CommandType> stringToCommandType = {
         { "run", Run }
 };
 
-/**
- * Executes the given command string with popen(), and captures
- * Implementation from:
- * https://stackoverflow.com/questions/52164723/how-to-execute-a-command-and-get-return-code-stdout-and-stderr-of-command-in-c
- * @param command: the command to be executed.
- */
-void execute(std::string& command)
-{
-    std::array<char, 128> buffer{};
-    std::string result;
-
-    std::cout << "Executing command: " << command << "..." << std::endl;
-
-    // Directs the output of stderr to stdout
-    // FIXME: the output from stderr and stdout might be unpredictably mixed
-    if (!endsWith(command, "2>&1"))
-        command += "2>&1";
-
-    auto pipe = popen(command.c_str(), "r");
-
-    if (!pipe) throw std::runtime_error("[ERROR] popen() failed!");
-    std::cout << "Execution output:" << std::endl;
-    while (!feof(pipe))
-    {
-        if (fgets(buffer.data(), 128, pipe) != nullptr)
-            // result += buffer.data();
-            std::cout << buffer.data();
-
-        // std::cout << result;
-    }
-
-    int returnCode = pclose(pipe);
-
-    std::cout << "Return code: " << returnCode << std::endl;
-}
-
-
+std::map<std::string, Distro> stringToDistro = {
+        { "ubuntu", Ubuntu },
+        { "alpine", Alpine }
+};
 
 /**
  * Runs the given command in a containerized environment.
  * Forks a new process that will execute the given command whilst the
  * parent process waits for the child process to finish.
  */
-void run(std::string& command)
+void run(const std::string& distroName, std::string command)
 {
+    Container container(distroName, generateContainerId(), "../res");
+    // If container set up fails, returns immediately
+    if (!container.setUp())
+        return;
+
     pid_t pid = fork();
 
     if (pid == 0)
@@ -62,11 +38,13 @@ void run(std::string& command)
         // The child process
         try
         {
-            execute(command);
+            // Initializes a container
+            container.execute(command);
         }
         catch (std::exception& ex)
         {
-            std::cout << "[ERROR] An error occurred while executing command: " << std::endl;
+            std::cout << "[ERROR] An error occurred while executing command: " << command << std::endl;
+            std::cout << ex.what() << std::endl;
         }
     }
     else
@@ -74,33 +52,66 @@ void run(std::string& command)
         // If it is the parent process, waits for the child to finish
         wait(nullptr);
         std::cout << "Exit from container: SUCCESS" << std::endl;
+        container.cleanUp();
     }
 }
 
-int main(int argc, char** argv)
+
+int main(int argc, char* argv[])
 {
-    if (argc < 2)
-        throw std::invalid_argument("[ERROR] There should be at least two arguments!");
+    // Sets up argument parsing
+    cxxopts::Options options(argv[0], "Linux container implemented in C++");
+    options.positional_help("[cmd-type] [cmd]").show_positional_help();
+    options.set_width(80).set_tab_expansion().add_options()
+            ("t,rootfs",
+             R"(The root file system for the container. Current options are {"ubuntu", "alpine"}.)",
+             cxxopts::value<std::string>()->default_value("ubuntu"))
+            ("cmd-type", R"(Type of actions to perform. Available options are {"run"}.)",
+             cxxopts::value<std::string>())
+            ("cmd", "The command to be executed in a containerized environment.",
+             cxxopts::value<std::vector<std::string>>())
+            ("h,help", "Print arguments and their descriptions")
+            ;
+    options.parse_positional({"cmd-type", "cmd"});
 
-    std::string commandTypeString(argv[1]);
-    CommandType commandType = stringToCommandType[commandTypeString];
-
-    //
-    std::string commandComplete;
-    for (int i = 2; i < argc; i ++)
+    try
     {
-        commandComplete += argv[i];
-        commandComplete += " ";
+        auto parsedOptions = options.parse(argc, argv);
+        if (parsedOptions.count("help"))
+        {
+            std::cout << options.help() << std::endl;
+            return 0;
+        }
+
+        if(!parsedOptions.count("cmd-type"))
+            throw std::invalid_argument(R"([ERROR] You have to enter a command type! (e.g. "run"))");
+
+        std::string commandTypeString = parsedOptions["cmd-type"].as<std::string>();
+        CommandType commandType = stringToCommandType[commandTypeString];
+
+        auto& commandArgs = parsedOptions["cmd"].as<std::vector<std::string>>();
+
+        std::ostringstream command;
+        std::copy(commandArgs.begin(), commandArgs.end(), std::ostream_iterator<std::string>(command, " "));
+
+        std::string distroName = parsedOptions["rootfs"].as<std::string>();
+        if (!availableDistros.count(distroName))
+            throw std::invalid_argument("[ERROR] Root file system " + distroName + " is not an option!");
+
+        // Performs actions depending on the second argument. e.g. Run
+        switch (commandType)
+        {
+            case Run:
+                run(distroName, command.str());
+                break;
+
+            default:
+                throw std::invalid_argument("[ERROR] Command " + commandTypeString + " not supported!");
+        }
     }
-
-    // Performs actions depending on the second argument. e.g. Run
-    switch (commandType)
+    catch (std::exception& e)
     {
-        case Run:
-            run(commandComplete);
-            break;
-
-        default:
-            throw std::invalid_argument("[ERROR] Command " + commandTypeString + " not supported!");
+        std::cout << e.what() << std::endl;
+        return 1;
     }
 }
