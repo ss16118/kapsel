@@ -24,36 +24,47 @@ std::map<std::string, Distro> stringToDistro = {
  * Forks a new process that will execute the given command whilst the
  * parent process waits for the child process to finish.
  */
-void run(const std::string& distroName, std::string command)
+void run(std::string containerId, std::string& distroName, std::string command)
 {
-    Container container(distroName, generateContainerId(), "../res");
-    // If container set up fails, returns immediately
-    if (!container.setUp())
-        return;
+    if (containerId.empty())
+        containerId = generateContainerId();
 
-    pid_t pid = fork();
+    std::string rootDir = "../res";
 
-    if (pid == 0)
+    Container* container = createContainer(distroName, containerId, rootDir, command);
+    if (setUpContainer(container))
     {
-        // The child process
-        try
-        {
-            // Initializes a container
-            container.execute(command);
-        }
-        catch (std::exception& ex)
-        {
-            std::cout << "[ERROR] An error occurred while executing command: " << command << std::endl;
-            std::cout << ex.what() << std::endl;
-        }
+        startContainer(container);
     }
-    else
-    {
-        // If it is the parent process, waits for the child to finish
-        wait(nullptr);
-        std::cout << "Exit from container: SUCCESS" << std::endl;
-        container.cleanUp();
-    }
+    cleanUpContainer(container);
+
+//    // If container set up fails, returns immediately
+//    if (!container.setUp())
+//        return;
+//
+//    pid_t pid = fork();
+//
+//    if (pid == 0)
+//    {
+//        // The child process
+//        try
+//        {
+//            // Initializes a container
+//            container.start(command);
+//        }
+//        catch (std::exception& ex)
+//        {
+//            std::cout << "[ERROR] An error occurred while executing command: " << command << std::endl;
+//            std::cout << ex.what() << std::endl;
+//        }
+//    }
+//    else
+//    {
+//        // If it is the parent process, waits for the child to finish
+//        wait(nullptr);
+//        std::cout << "Exit from container: SUCCESS" << std::endl;
+//        container.cleanUp();
+//    }
 }
 
 
@@ -66,10 +77,16 @@ int main(int argc, char* argv[])
             ("t,rootfs",
              R"(The root file system for the container. Current options are {"ubuntu", "alpine"}.)",
              cxxopts::value<std::string>()->default_value("ubuntu"))
+
+            ("i,container-id", "The ID that will be given to the container.",
+                    cxxopts::value<std::string>())
+
             ("cmd-type", R"(Type of actions to perform. Available options are {"run"}.)",
              cxxopts::value<std::string>())
+
             ("cmd", "The command to be executed in a containerized environment.",
              cxxopts::value<std::vector<std::string>>())
+
             ("h,help", "Print arguments and their descriptions")
             ;
     options.parse_positional({"cmd-type", "cmd"});
@@ -98,11 +115,15 @@ int main(int argc, char* argv[])
         if (!availableDistros.count(distroName))
             throw std::invalid_argument("[ERROR] Root file system " + distroName + " is not an option!");
 
+        std::string containerId;
+        if (parsedOptions.count("container-id"))
+            containerId = parsedOptions["container-id"].as<std::string>();
+
         // Performs actions depending on the second argument. e.g. Run
         switch (commandType)
         {
             case Run:
-                run(distroName, command.str());
+                run(containerId, distroName, command.str());
                 break;
 
             default:

@@ -7,30 +7,22 @@
 
 #include <vector>
 
-class Container
+/**
+ * A struct representing an individual container.
+ */
+struct Container
 {
-private:
-    const std::string& distroName;
-    const std::string& containerId;
-    const std::string& rootDir;
-    std::string containerDir;
+    std::string distroName;
+    std::string id;
+    std::string rootDir;
+    std::string dir;
     std::string currentUser;
-
-    // Set up functions
-    void enterChrootJail();
-    void mountDirectories();
-    void setupContainerImage();
-
-    // Clean up functions
-    void unmountDirectories();
-    void removeContainerDirectory();
-
-    void contain();
-public:
-    explicit Container(const std::string& distroName, const std::string& containerId, const std::string& rootDir);
-    void execute(std::string& command);
-    bool setUp();
-    bool cleanUp();
+    std::string command;
 };
+
+bool setUpContainer(Container* container);
+bool cleanUpContainer(Container* container);
+Container* createContainer(std::string& distroName, std::string& containerId, std::string& rootDir, std::string& command);
+void startContainer(Container* container);
 
 #endif //CONTAINER_CPP_CONTAINER_H
