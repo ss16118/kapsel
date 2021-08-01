@@ -182,6 +182,21 @@ void enterChrootJail(Container* container)
 }
 
 /**
+ * Mounts the necessary directories (e.g. proc, sys, dev) after entering
+ * the chroot jail.
+ */
+void mountDirectories(Container* container)
+{
+    std::string containerDir = container->dir;
+    std::cout << "Mounting directories: proc" << std::endl;
+
+    if (mount("proc", "/proc", "proc", 0, nullptr) != 0)
+        throw std::runtime_error("[ERROR] Mount /proc: FAILED [Errno " + std::to_string(errno) + "]");
+
+    std::cout << "Mounting directories: SUCCESS" << std::endl;
+}
+
+/**
  * Clears the environment variables and initializes new ones which will be
  * used in the container.
  */
@@ -190,9 +205,10 @@ void setUpVariables(Container* container)
     clearenv();
 
     // Sets the new hostname to be the ID of the container
-    char buffer[256];
-    sprintf(buffer, "hostname %s", container->id.c_str());
-    system(buffer);
+//    char buffer[256];
+//    sprintf(buffer, "hostname %s", container->id.c_str());
+//    system(buffer);
+    sethostname(container->id.c_str(), container->id.length());
 
     setenv("HOME", "/", 0);
     setenv("DISPLAY", ":0.0", 0);
@@ -200,13 +216,50 @@ void setUpVariables(Container* container)
     setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin:/src:/usr/local/bin:/usr/local/sbin", 0);
 }
 
-
-void contain(Container* container)
+/**
+ * Creates new name spaces for the container.
+ */
+void createNamespace()
 {
-    enterChrootJail(container);
-    setUpVariables(container);
-    if (mount("proc", "/proc", "proc", 0, nullptr) < 0)
-        throw std::runtime_error("Mount proc: FAILED");
+    std::cout << "Creating namespace";
+    if (unshare(CLONE_NEWNS) != 0)
+        throw std::runtime_error("[ERROR] Create namespace: FAILED");
+    std::cout << "Create namespace: SUCCESS" << std::endl;
+}
+
+
+/**
+ * Initializes a containerized environment in which the given Container will be run.
+ * Performs the following actions in order:
+ * 1. Enters the chroot jail.
+ * 2. Mounts the a list of required directories to the root file system in the container.
+ * 3. Sets up the environment variables in the container.
+ * @return true if the all containment actions have been performed successfully, false otherwise.
+ */
+bool contain(Container* container)
+{
+    std::cout << "Initializing container " << container->id << std::endl;
+    try
+    {
+        // From:
+        // https://github.com/swetland/mkbox/blob/master/mkbox.c
+        // https://github.com/dmitrievanthony/sprat/blob/master/src/container.c
+        // ensure that changes to our mount namespace do not "leak" to
+        // outside namespaces (what mount --make-rprivate / does)
+        if (mount("/", "/", nullptr, MS_PRIVATE, nullptr) != 0)
+            throw std::runtime_error("[ERROR] Set MS_PRIVATE to fs: FAILED " + std::to_string(errno) + "]");
+        enterChrootJail(container);
+        mountDirectories(container);
+        setUpVariables(container);
+        // createNamespace();
+        return true;
+    }
+    catch (std::exception& ex)
+    {
+        std::cout << "[ERROR] Initialize container: FAILED" << std::endl;
+        std::cout << ex.what() << std::endl;
+        return false;
+    }
 }
 
 
@@ -216,27 +269,38 @@ void contain(Container* container)
 int execute(void* arg)
 {
     auto* container = (Container*) arg;
-    contain(container);
+    if (!contain(container))
+        return -1;
+
     std::string command = container->command;
     std::cout << "Executing command: " << command << std::endl;
-    // char* args[] = { "/bin/sh", const_cast<char *>(command.c_str()), nullptr };
-    char* args[] = { "/bin/bash", nullptr };
-    if (execv(args[0], &args[0]) == -1)
+    if (system(command.c_str()) == -1)
     {
         std::cout << "[ERROR] Execute command " << command << ": FAILED [Errno " << errno << "]" << std::endl;
         return -1;
     }
+    if (umount("proc") != 0)
+        throw std::runtime_error("[ERROR] Unmount /proc: FAILED [Errno " + std::to_string(errno) + "]");
+
     return 0;
+//    char* args[] = { "/bin/bash", nullptr };
+//    if (execv(args[0], &args[0]) == -1)
+//    {
+//        std::cout << "[ERROR] Execute command " << command << ": FAILED [Errno " << errno << "]" << std::endl;
+//        return -1;
+//    }
+//    return 0;
 }
 
 /**
+ *
  * Implementations from:
  * - https://cesarvr.github.io/post/2018-05-22-create-containers/
  * - https://github1s.com/7aske/ccont/blob/master/source/jail.c
  */
 void startContainer(Container* container)
 {
-    int flags = CLONE_NEWPID | CLONE_NEWUTS | SIGCHLD;
+    int flags = CLONE_NEWPID | CLONE_NEWUTS | SIGCHLD | CLONE_NEWNS;
     char* childStack = createStack();
     int pid = clone(execute, childStack, flags, (void*) container);
     if (pid < 0)
@@ -254,75 +318,16 @@ void startContainer(Container* container)
 }
 
 
-
 /**
- * Mounts the necessary directories (e.g. proc, sys, dev) before entering
- * the chroot jail. The commands to run are based on Arch Linux Wiki's guide
- * on using chroot.
- * https://wiki.archlinux.org/title/Chroot#Using_chroot
- */
-void mountDirectories(Container* container)
-{
-    std::string containerDir = container->dir;
-    std::cout << "Mounting directories: proc, sys, dev" << std::endl;
-    std::string mountProc = "mount -t proc /proc " + containerDir + "/proc";
-    std::string mountSys = "mount -t sysfs /sys " + containerDir + "/sys";
-    std::string mountDev = "mount --rbind /dev " + containerDir + "/dev";
-    // If only --rbind is called the directory might be umountable
-    // --make-rslave makes sure that any changes made in the container's dev will not propagate back
-    std::string mountDevMakeRSlave = "mount --make-rslave " + containerDir + "/dev";
-    std::string mountCommands[] = {
-            // mountProc,
-            mountSys,
-            mountDev,
-            mountDevMakeRSlave
-    };
-
-    for (const auto& cmd : mountCommands)
-    {
-        int status = system(cmd.c_str());
-        if (status != 0)
-            throw std::runtime_error("[ERROR] Execute command '" + cmd + "': FAILED [" + std::to_string(status) + "]");
-    }
-    std::cout << "Mounting directories: SUCCESS" << std::endl;
-}
-
-/**
- * Creates new name spaces for the container.
- */
- void createNamespace()
-{
-     std::cout << "Creating namespace";
-     if (unshare(CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWPID) != 0)
-         throw std::runtime_error("[ERROR] Create namespace: FAILED");
-    std::cout << "Create namespace: SUCCESS" << std::endl;
- }
-
-
-/**
- * Unmounts the directories that have been mounted before entering the
+ * Unmounts the directories that have been mounted after entering the
  * chroot jail (e.g. proc, sys, dev).
  */
 void unmountDirectories(Container* container)
 {
     std::string containerDir = container->dir;
-    std::cout << "Unmounting directories: proc, sys, dev" << std::endl;
-    // FIXME There has to be a better solution than using the -l flag
-    std::string unmountProc = "umount -l " + containerDir + "/proc";
-    std::string unmountSys = "umount -l " + containerDir + "/sys";
-    std::string unmountDev = "umount -l " + containerDir + "/dev";
-    std::string unmountCommands[] = {
-            unmountProc,
-            unmountSys,
-            unmountDev
-    };
-
-    for (const auto& cmd : unmountCommands)
-    {
-        int status = system(cmd.c_str());
-        if (status != 0)
-            throw std::runtime_error("[ERROR] Execute command '" + cmd + "': FAILED [" + std::to_string(status) + "]");
-    }
+    std::cout << "Unmounting directories: proc" << std::endl;
+    if (umount((container->dir + "/proc").c_str()) != 0)
+        throw std::runtime_error("[ERROR] Unmount /proc: FAILED [Errno " + std::to_string(errno) + "]");
     std::cout << "Unmounting directories: SUCCESS" << std::endl;
 }
 
