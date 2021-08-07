@@ -46,14 +46,15 @@ Container* createContainer(
 
 /**
  * Sets up the root file system of the container as per the specified linux distro and the
- * root directory. This function performs the following actions in order:
+ * root directory. This function performs the following actions:
  *
  * 1. Checks if the cache directory exists in the root directory. Creates it if it does not.
  * 2. Checks if the rootfs archive for the specified distro exists. Fetches it from the pre-defined
  * download URL if it is not present in the cache directory.
- * 3. Checks if there is a directory present for the container in rootDir/containers/. Creates one
- * for this container with the container ID as the directory name if it has not been created.
- * 4. Extracts the file system of the distro to the container's directory.
+ * 3. If the 'rootfs' directory does not exist for the specified distro, creates said directory
+ * and unpacks the file system of the distro in it.
+ * 4. Creates the directories needed by the overlay fs.
+ * Implementation based on https://github.com/Fewbytes/rubber-docker/blob/master/levels/10_setuid/rd.py
  *
  * @param container: the container whose file system will be created.
  */
@@ -96,8 +97,26 @@ void setupContainerImage(Container* container)
         std::cout << "Rootfs for " + container->distroName + " does not exist." << std::endl;
         std::cout << "Downloading " + baseArchiveName + " from " + downloadUrl << std::endl;
         sprintf(buffer, "wget -O %s %s -q --show-progress", rootfsArchive.c_str(), downloadUrl.c_str());
-        system(buffer);
+        if (system(buffer) != 0)
+            throw std::runtime_error("[ERROR] Download rootfs archive for " + distroName + ": FAILED");
     }
+
+    // Creates the rootfs folder for the given distro and extracts the archive
+    std::string imageRootDir = cacheDir + "/rootfs";
+    if (!std::filesystem::exists(imageRootDir))
+    {
+        if (std::filesystem::create_directories(imageRootDir))
+            std::cout << "Create directory " + imageRootDir + ": SUCCESS" << std::endl;
+        else
+            throw std::runtime_error("[ERROR] Create directory " + imageRootDir + ": FAILED");
+
+        // Extracts the files
+        std::cout << "Extracting rootfs from " << rootfsArchive << " to " << imageRootDir << std::endl;
+        sprintf(buffer, "tar xzvf %s -C %s > /dev/null", rootfsArchive.c_str(), imageRootDir.c_str());
+        if (system(buffer) != 0)
+            throw std::runtime_error("[ERROR] Extract " + rootfsArchive + " to " + imageRootDir + ": FAILED");
+    }
+    
 
     container->dir = container->rootDir + "/containers/" + container->id;
     std::string containerDir = container->dir;
@@ -109,18 +128,25 @@ void setupContainerImage(Container* container)
         if (std::filesystem::create_directories(containerDir))
             std::cout << "Create container directory " + containerDir + ": SUCCESS" << std::endl;
         else
-            throw std::runtime_error("[ERROR] Failed to create container directory " + containerDir);
+            throw std::runtime_error("[ERROR] Create container directory " + containerDir + ": FAILED");
 
-        sprintf(buffer, "tar xzvf %s -C %s > /dev/null", rootfsArchive.c_str(), containerDir.c_str());
-        if (system(buffer) != 0)
-            throw std::runtime_error("[ERROR] Failed to extract " + rootfsArchive + " to " + containerDir);
-        else
-            std::cout << "Extract rootfs " + rootfsArchive + " to " + containerDir + ": SUCCESS" << std::endl;
+        // Creates copy-on-write (upper), and work directory for the overlay fs
+        std::string upperDir = containerDir + "/copy-on-write";
+        std::string workDir = containerDir + "/work";
+        container->rootfs = containerDir + "/rootfs";
+        std::cout << "Setting up overlay fs directories in " << containerDir << std::endl;
+        std::vector<std::string> dirs = { upperDir, workDir, container->rootfs };
+        for (const auto& dir : dirs)
+        {
+            if (!std::filesystem::create_directories(dir))
+                throw std::runtime_error("[ERROR] Create " + dir + ": FAILED");
+        }
+        std::cout << "Set up overlay fs directories in " << containerDir << ": SUCCESS" << std::endl;
 
         // Makes the current user the owner of the container directory
         sprintf(buffer, "chown -R %s %s", currentUser.c_str(), containerDir.c_str());
         if (system(buffer) != 0)
-            throw std::runtime_error("[ERROR] Failed to make " + currentUser + " the owner of " + containerDir);
+            throw std::runtime_error("[ERROR] Make" + currentUser + " the owner of " + containerDir + ": FAILED");
         else
             std::cout << "Setting the owner of " + containerDir + " to " + currentUser << std::endl;
     }
@@ -175,8 +201,8 @@ void enterChrootJail(Container* container)
 {
     std::cout << "Entering chroot jail" << std::endl;
 
-    if (chroot(container->dir.c_str()) != 0)
-        throw std::runtime_error("[ERROR] chroot " + container->dir + ": FAILED");
+    if (chroot(container->rootfs.c_str()) != 0)
+        throw std::runtime_error("[ERROR] chroot " + container->rootfs + ": FAILED");
     chdir("/");
     std::cout << "Entering chroot jail: SUCCESS" << std::endl;
 }
@@ -247,6 +273,17 @@ bool enterContainment(Container* container)
         // outside namespaces (what mount --make-rprivate / does)
         if (mount("/", "/", nullptr, MS_PRIVATE | MS_REC, nullptr) != 0)
             throw std::runtime_error("[ERROR] Set MS_PRIVATE to fs: FAILED " + std::to_string(errno) + "]");
+
+        // Mounts the overlay fs
+        std::cout << "Mounting overlay fs " << container->rootfs << std::endl;
+        std::string imageRootDir = container->rootDir + "/cache/" + container->distroName + "/rootfs";
+        std::string upperDir = container->dir + "/copy-on-write";
+        std::string workDir = container->dir + "/work";
+        std::string mountData = "lowerdir=" + imageRootDir + ",upperdir=" + upperDir + ",workdir=" + workDir;
+        if (mount("overlay", container->rootfs.c_str(), "overlay", MS_NODEV, mountData.c_str()) != 0)
+            throw std::runtime_error("[ERROR] Mount overlay fs: FAILED");
+        std::cout << "Mounting overlay fs " << container->rootfs << ": SUCCESS" << std::endl;
+
         enterChrootJail(container);
         mountDirectories(container);
         setUpVariables(container);
@@ -265,11 +302,13 @@ bool enterContainment(Container* container)
  * Unmounts the directories that have been mounted after entering the
  * chroot jail (e.g. proc, sys, dev).
  */
-void unmountDirectories()
+void unmountDirectories(Container* container)
 {
     std::cout << "Unmounting directories: proc" << std::endl;
     if (umount("proc") != 0)
         throw std::runtime_error("[ERROR] Unmount /proc: FAILED [Errno " + std::to_string(errno) + "]");
+
+    // umount(container->rootfs.c_str());
     std::cout << "Unmounting directories: SUCCESS" << std::endl;
 }
 
@@ -278,9 +317,9 @@ void unmountDirectories()
  * Performs the following actions before exiting from the container:
  * 1. Unmounts the mounted directories
  */
-void exitContainment()
+void exitContainment(Container* container)
 {
-    unmountDirectories();
+    unmountDirectories(container);
 }
 
 
@@ -301,7 +340,7 @@ int execute(void* arg)
         std::cout << "[ERROR] Execute command " << command << ": FAILED [Errno " << errno << "]" << std::endl;
         return -1;
     }
-    exitContainment();
+    exitContainment(container);
     return 0;
 }
 
@@ -348,7 +387,7 @@ void removeContainerDirectory(Container* container)
 /**
  * Cleans up the system after a container finishes running.
  * Performs the following actions:
- * 1. Unmounts the mounted directories.
+ * 1. Unmounts the overlay fs.
  * 2. Deletes the container rootfs directory.
  * 3. Deallocates the memory taken up by the given Container struct.
  * @return true if clean up succeeds, false otherwise.
@@ -359,7 +398,6 @@ bool cleanUpContainer(Container* container)
     std::cout << "Clean up container " << containerId << std::endl;
     try
     {
-        // unmountDirectories(container);
         removeContainerDirectory(container);
         delete container;
         std::cout << "Clean up container " << containerId << ": SUCCESS" << std::endl;

@@ -16,6 +16,7 @@ struct Container
     std::string id;
     std::string rootDir;
     std::string dir;
+    std::string rootfs;
     std::string currentUser;
     std::string command;
 };
