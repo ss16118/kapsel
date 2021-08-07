@@ -205,9 +205,6 @@ void setUpVariables(Container* container)
     clearenv();
 
     // Sets the new hostname to be the ID of the container
-//    char buffer[256];
-//    sprintf(buffer, "hostname %s", container->id.c_str());
-//    system(buffer);
     sethostname(container->id.c_str(), container->id.length());
 
     setenv("HOME", "/", 0);
@@ -230,13 +227,15 @@ void createNamespace()
 
 /**
  * Initializes a containerized environment in which the given Container will be run.
- * Performs the following actions in order:
- * 1. Enters the chroot jail.
- * 2. Mounts the a list of required directories to the root file system in the container.
- * 3. Sets up the environment variables in the container.
+ * Performs the following actions in order upon entering the execute() function:
+ * 1. Mounts the root mount as private and recursively so that the sub-mounts will
+ * not be visible to the parent mount.
+ * 2. Enters chroot jail.
+ * 3. Mounts the a list of required directories to the root file system in the container.
+ * 4. Sets up the environment variables in the container.
  * @return true if the all containment actions have been performed successfully, false otherwise.
  */
-bool contain(Container* container)
+bool enterContainment(Container* container)
 {
     std::cout << "Initializing container " << container->id << std::endl;
     try
@@ -246,7 +245,7 @@ bool contain(Container* container)
         // https://github.com/dmitrievanthony/sprat/blob/master/src/container.c
         // ensure that changes to our mount namespace do not "leak" to
         // outside namespaces (what mount --make-rprivate / does)
-        if (mount("/", "/", nullptr, MS_PRIVATE, nullptr) != 0)
+        if (mount("/", "/", nullptr, MS_PRIVATE | MS_REC, nullptr) != 0)
             throw std::runtime_error("[ERROR] Set MS_PRIVATE to fs: FAILED " + std::to_string(errno) + "]");
         enterChrootJail(container);
         mountDirectories(container);
@@ -262,6 +261,29 @@ bool contain(Container* container)
     }
 }
 
+/**
+ * Unmounts the directories that have been mounted after entering the
+ * chroot jail (e.g. proc, sys, dev).
+ */
+void unmountDirectories()
+{
+    std::cout << "Unmounting directories: proc" << std::endl;
+    if (umount("proc") != 0)
+        throw std::runtime_error("[ERROR] Unmount /proc: FAILED [Errno " + std::to_string(errno) + "]");
+    std::cout << "Unmounting directories: SUCCESS" << std::endl;
+}
+
+
+/**
+ * Performs the following actions before exiting from the container:
+ * 1. Unmounts the mounted directories
+ */
+void exitContainment()
+{
+    unmountDirectories();
+}
+
+
 
 /**
  * @param arg: a pointer to the Container struct which represents the container will be run.
@@ -269,7 +291,7 @@ bool contain(Container* container)
 int execute(void* arg)
 {
     auto* container = (Container*) arg;
-    if (!contain(container))
+    if (!enterContainment(container))
         return -1;
 
     std::string command = container->command;
@@ -279,17 +301,8 @@ int execute(void* arg)
         std::cout << "[ERROR] Execute command " << command << ": FAILED [Errno " << errno << "]" << std::endl;
         return -1;
     }
-    if (umount("proc") != 0)
-        throw std::runtime_error("[ERROR] Unmount /proc: FAILED [Errno " + std::to_string(errno) + "]");
-
+    exitContainment();
     return 0;
-//    char* args[] = { "/bin/bash", nullptr };
-//    if (execv(args[0], &args[0]) == -1)
-//    {
-//        std::cout << "[ERROR] Execute command " << command << ": FAILED [Errno " << errno << "]" << std::endl;
-//        return -1;
-//    }
-//    return 0;
 }
 
 /**
@@ -315,20 +328,6 @@ void startContainer(Container* container)
         std::cout << "[ERROR] waitpid() failed for child process " << pid << std::endl;
     if (WIFEXITED(exitStatus))
         std::cout << "Container " << container->id << " exit status: " << WEXITSTATUS(exitStatus) << std::endl;
-}
-
-
-/**
- * Unmounts the directories that have been mounted after entering the
- * chroot jail (e.g. proc, sys, dev).
- */
-void unmountDirectories(Container* container)
-{
-    std::string containerDir = container->dir;
-    std::cout << "Unmounting directories: proc" << std::endl;
-    if (umount((container->dir + "/proc").c_str()) != 0)
-        throw std::runtime_error("[ERROR] Unmount /proc: FAILED [Errno " + std::to_string(errno) + "]");
-    std::cout << "Unmounting directories: SUCCESS" << std::endl;
 }
 
 /**
