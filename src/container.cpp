@@ -4,16 +4,25 @@
 #include <string>
 #include <iostream>
 #include <sys/mount.h>
+#include <sys/syscall.h>
 #include <filesystem>
 #include <unistd.h>
 #include <cstring>
-#include <csignal>
 #include <sched.h>
 #include <sys/wait.h>
 
 #include "constants.h"
 #include "container.h"
-#include "utils.h"
+
+
+/**
+ * A wrapper around the pivot_root() function.
+ * More details on the man page of pivot_root().
+ */
+long pivot_root(const char* newRoot, const char* putOld)
+{
+    return syscall(SYS_pivot_root, newRoot, putOld);
+}
 
 /**
  * Allocates memory for a Container struct and initializes it with the given parameters.
@@ -194,17 +203,31 @@ char* createStack(const uint32_t stackSize = 65536)
 
 
 /**
- * Starts a chroot jail for the container and sets up the mounts for
- * the current container.
+ * Uses pivot_root() to make the container's rootfs directory the new root file system.
+ * Implementation based on:
+ * https://github.com/Fewbytes/rubber-docker/blob/master/levels/10_setuid/rd.py
  */
-void enterChrootJail(Container* container)
+void pivotRoot(Container* container)
 {
-    std::cout << "Entering chroot jail" << std::endl;
+    std::cout << "Performing pivot root" << std::endl;
 
-    if (chroot(container->rootfs.c_str()) != 0)
-        throw std::runtime_error("[ERROR] chroot " + container->rootfs + ": FAILED");
+    std::string tempDir = container->rootfs + "/temp";
+    if(!std::filesystem::create_directories(tempDir))
+        throw std::runtime_error("[ERROR] Create temp directory " + tempDir + ": FAILED");
+
+    if (pivot_root(container->rootfs.c_str(), tempDir.c_str()) < 0)
+        throw std::runtime_error("[ERROR] Pivot root: FAILED");
+
     chdir("/");
-    std::cout << "Entering chroot jail: SUCCESS" << std::endl;
+
+    // Unmounts the temp directory
+    if (umount2("/temp", MNT_DETACH))
+        throw std::runtime_error("[ERROR] Unmount temp directory: FAILED [Errno " + std::to_string(errno) + "]");
+
+    if (rmdir("/temp") < 0)
+        throw std::runtime_error("[ERROR] Remove temp directory: FAILED [Errno " + std::to_string(errno) + "]");
+
+    std::cout << "Perform pivot root: SUCCESS" << std::endl;
 }
 
 /**
@@ -256,7 +279,8 @@ void createNamespace()
  * Performs the following actions in order upon entering the execute() function:
  * 1. Mounts the root mount as private and recursively so that the sub-mounts will
  * not be visible to the parent mount.
- * 2. Enters chroot jail.
+ * 2. Changes the root file system uses pivot_root(). This step has the effect as
+ * performing chroot, except for the fact that it is more secure.
  * 3. Mounts the a list of required directories to the root file system in the container.
  * 4. Sets up the environment variables in the container.
  * @return true if the all containment actions have been performed successfully, false otherwise.
@@ -284,10 +308,9 @@ bool enterContainment(Container* container)
             throw std::runtime_error("[ERROR] Mount overlay fs: FAILED");
         std::cout << "Mounting overlay fs " << container->rootfs << ": SUCCESS" << std::endl;
 
-        enterChrootJail(container);
+        pivotRoot(container);
         mountDirectories(container);
         setUpVariables(container);
-        // createNamespace();
         return true;
     }
     catch (std::exception& ex)
@@ -302,13 +325,12 @@ bool enterContainment(Container* container)
  * Unmounts the directories that have been mounted after entering the
  * chroot jail (e.g. proc, sys, dev).
  */
-void unmountDirectories(Container* container)
+void unmountDirectories()
 {
     std::cout << "Unmounting directories: proc" << std::endl;
     if (umount("proc") != 0)
         throw std::runtime_error("[ERROR] Unmount /proc: FAILED [Errno " + std::to_string(errno) + "]");
 
-    // umount(container->rootfs.c_str());
     std::cout << "Unmounting directories: SUCCESS" << std::endl;
 }
 
@@ -319,7 +341,7 @@ void unmountDirectories(Container* container)
  */
 void exitContainment(Container* container)
 {
-    unmountDirectories(container);
+    unmountDirectories();
 }
 
 
