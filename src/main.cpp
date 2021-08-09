@@ -85,7 +85,7 @@ int main(int argc, char* argv[])
              cxxopts::value<std::string>())
 
             ("cmd", "The command to be executed in a containerized environment.",
-             cxxopts::value<std::vector<std::string>>())
+             cxxopts::value<std::vector<std::string>>()->default_value("/bin/sh"))
 
             ("h,help", "Print arguments and their descriptions")
             ;

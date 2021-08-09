@@ -5,14 +5,27 @@
 #include <iostream>
 #include <sys/mount.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <filesystem>
 #include <unistd.h>
 #include <cstring>
 #include <sched.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 
 #include "constants.h"
 #include "container.h"
+
+/**
+ * A struct representing a linux device file.
+ */
+struct Device
+{
+    std::string name;
+    int type;
+    int major;
+    int minor;
+};
 
 
 /**
@@ -55,19 +68,16 @@ Container* createContainer(
 
 /**
  * Sets up the root file system of the container as per the specified linux distro and the
- * root directory. This function performs the following actions:
+ * root directory (the lower-dir in an overlay fs). This function performs the following actions:
  *
  * 1. Checks if the cache directory exists in the root directory. Creates it if it does not.
  * 2. Checks if the rootfs archive for the specified distro exists. Fetches it from the pre-defined
  * download URL if it is not present in the cache directory.
  * 3. If the 'rootfs' directory does not exist for the specified distro, creates said directory
  * and unpacks the file system of the distro in it.
- * 4. Creates the directories needed by the overlay fs.
  * Implementation based on https://github.com/Fewbytes/rubber-docker/blob/master/levels/10_setuid/rd.py
- *
- * @param container: the container whose file system will be created.
  */
-void setupContainerImage(Container* container)
+void setUpContainerImage(Container* container)
 {
     std::string rootDir = container->rootDir;
     std::string distroName = container->distroName;
@@ -125,8 +135,21 @@ void setupContainerImage(Container* container)
         if (system(buffer) != 0)
             throw std::runtime_error("[ERROR] Extract " + rootfsArchive + " to " + imageRootDir + ": FAILED");
     }
-    
+}
 
+/**
+ * Sets up the required folders in the container's directory (the upper-dir, merged-dir and
+ * work-dir in an overlay fs). Performs the following actions:
+ * 1. Creates the container's directory in 'rootDir', if it does not exist.
+ * 2. Creates the folders needed for the overlay fs. Details of an overlay fs can be
+ * found here: https://wiki.archlinux.org/title/Overlay_filesystem.
+ * Implementation based on https://github.com/Fewbytes/rubber-docker/blob/master/levels/10_setuid/rd.py
+ *
+ * @param container the container whose file system will be created.
+ */
+void setUpContainerDirectory(Container* container)
+{
+    char buffer[256];
     container->dir = container->rootDir + "/containers/" + container->id;
     std::string containerDir = container->dir;
     std::string currentUser = container->currentUser;
@@ -164,8 +187,10 @@ void setupContainerImage(Container* container)
 /**
  * Prepares and sets up the environment required for the container to
  * run correctly. Performs the following actions:
- *
  * 1. Downloads and extracts the rootfs to the specified folder.
+ * 2. Initializes the overlay fs folders in the container's directory.
+ *
+ * @param container a struct representing the container whose file system will initialized.
  * @return true if set up succeeds, false otherwise.
  */
 bool setUpContainer(Container* container)
@@ -173,7 +198,8 @@ bool setUpContainer(Container* container)
     std::cout << "Set up container " << container->id << std::endl;
     try
     {
-        setupContainerImage(container);
+        setUpContainerImage(container);
+        setUpContainerDirectory(container);
         std::cout << "Set up container " << container->id << ": SUCCESS" << std::endl;
         return true;
     }
@@ -201,6 +227,24 @@ char* createStack(const uint32_t stackSize = 65536)
     return stack + stackSize;
 }
 
+/**
+ * Mounts the overlay fs of the given container so that the rootfs archive does
+ * not have to be unpacked every time a new container is created. More details can
+ * be found at:
+ * - https://www.kernel.org/doc/Documentation/filesystems/overlayfs.txt
+ * - https://wiki.archlinux.org/title/Overlay_filesystem
+ */
+void mountOverlayFileSystem(Container* container)
+{
+    std::cout << "Mounting overlay fs " << container->rootfs << std::endl;
+    std::string imageRootDir = container->rootDir + "/cache/" + container->distroName + "/rootfs";
+    std::string upperDir = container->dir + "/copy-on-write";
+    std::string workDir = container->dir + "/work";
+    std::string mountData = "lowerdir=" + imageRootDir + ",upperdir=" + upperDir + ",workdir=" + workDir;
+    if (mount("overlay", container->rootfs.c_str(), "overlay", MS_NODEV, mountData.c_str()) != 0)
+        throw std::runtime_error("[ERROR] Mount overlay fs: FAILED");
+    std::cout << "Mounting overlay fs " << container->rootfs << ": SUCCESS" << std::endl;
+}
 
 /**
  * Uses pivot_root() to make the container's rootfs directory the new root file system.
@@ -237,13 +281,71 @@ void pivotRoot(Container* container)
 void mountDirectories(Container* container)
 {
     std::string containerDir = container->dir;
-    std::cout << "Mounting directories: proc" << std::endl;
+    std::cout << "Mounting directories: proc, sys, dev" << std::endl;
 
     if (mount("proc", "/proc", "proc", 0, nullptr) != 0)
         throw std::runtime_error("[ERROR] Mount /proc: FAILED [Errno " + std::to_string(errno) + "]");
 
+    if (mount("sysfs", "/sys", "sysfs", 0, nullptr) != 0)
+        throw std::runtime_error("[ERROR] Mount /sys: FAILED [Errno " + std::to_string(errno) + "]");
+
+    if (mount("tmpfs", "/dev", "tmpfs", MS_NOSUID | MS_STRICTATIME, nullptr) != 0)
+        throw std::runtime_error("[ERROR] Mount /dev: FAILED [Errno " + std::to_string(errno) + "]");
+
     std::cout << "Mounting directories: SUCCESS" << std::endl;
 }
+
+/**
+ * Creates and adds some basic devices inside the container.
+ * Implementation from:
+ * - https://github.com/Fewbytes/rubber-docker/blob/master/levels/10_setuid/rd.py
+ * - https://github.com/dmitrievanthony/sprat/blob/master/src/container.c
+ */
+void setUpDev(Container* container)
+{
+    std::cout << "Creating basic devices" << std::endl;
+    std::string devDir = "/dev/";
+    // Creates and mounts /dev/pts
+    std::string devPtsDir = devDir + "pts";
+    if (!std::filesystem::exists(devPtsDir))
+    {
+        if (!std::filesystem::create_directories(devPtsDir))
+            throw std::runtime_error("[ERROR] Create " + devPtsDir + ": FAILED");
+
+        if (mount("devpts", devPtsDir.c_str(), "devpts", MS_NOEXEC | MS_NOSUID, "newinstance,ptmxmode=0666,mode=620,gid=5") < 0)
+            throw std::runtime_error("[ERROR] Mount " + devPtsDir + ": FAILED [" + std::to_string(errno) + "]");
+    }
+
+    // Creates symlinks for stdin, stdout and stderr
+    std::vector<std::string> streams = { "stdin", "stdout", "stderr" };
+    if (symlink("/proc/self/fd", (devDir + "fd").c_str()) < 0)
+        throw std::runtime_error("[ERROR] Create symlink for fd: FAILED [" + std::to_string(errno) + "]");
+
+    for (std::size_t i = 0; i < streams.size(); i++)
+    {
+        std::string stream = streams.at(i);
+        if (symlink(("/proc/self/fd/" + std::to_string(i)).c_str(), (devDir + stream).c_str()) < 0)
+            throw std::runtime_error("[ERROR] Create symlink for " + stream + ": FAILED [" + std::to_string(errno) + "]");
+    }
+
+    std::vector<Device> devs = {
+            { "null", S_IFCHR, 1, 3 },
+            { "zero", S_IFCHR, 1, 5 },
+            { "random", S_IFCHR, 1, 8 },
+            { "urandom", S_IFCHR, 1, 9 },
+            { "console", S_IFCHR, 136, 1 },
+            { "tty", S_IFCHR, 5, 0 },
+            { "full", S_IFCHR, 1, 7 }
+    };
+
+    for (const auto& dev : devs)
+    {
+        if (mknod((devDir + dev.name).c_str(), 0666 | dev.type, makedev(dev.major, dev.minor)) < 0)
+            throw std::runtime_error("[ERROR] Create device " + dev.name + ": FAILED [" + std::to_string(errno) + "]");
+    }
+    std::cout << "Create basic devices: SUCCESS" << std::endl;
+}
+
 
 /**
  * Clears the environment variables and initializes new ones which will be
@@ -262,27 +364,18 @@ void setUpVariables(Container* container)
     setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin:/src:/usr/local/bin:/usr/local/sbin", 0);
 }
 
-/**
- * Creates new name spaces for the container.
- */
-void createNamespace()
-{
-    std::cout << "Creating namespace";
-    if (unshare(CLONE_NEWNS) != 0)
-        throw std::runtime_error("[ERROR] Create namespace: FAILED");
-    std::cout << "Create namespace: SUCCESS" << std::endl;
-}
-
 
 /**
  * Initializes a containerized environment in which the given Container will be run.
  * Performs the following actions in order upon entering the execute() function:
  * 1. Mounts the root mount as private and recursively so that the sub-mounts will
  * not be visible to the parent mount.
- * 2. Changes the root file system uses pivot_root(). This step has the effect as
+ * 2. Mounts the overlay file system.
+ * 3. Changes the root file system uses pivot_root(). This step has the effect as
  * performing chroot, except for the fact that it is more secure.
- * 3. Mounts the a list of required directories to the root file system in the container.
- * 4. Sets up the environment variables in the container.
+ * 4. Mounts the a list of required directories to the root file system in the container.
+ * 5. Creates and sets up basic devices in the container.
+ * 6. Sets up the environment variables in the container.
  * @return true if the all containment actions have been performed successfully, false otherwise.
  */
 bool enterContainment(Container* container)
@@ -298,18 +391,10 @@ bool enterContainment(Container* container)
         if (mount("/", "/", nullptr, MS_PRIVATE | MS_REC, nullptr) != 0)
             throw std::runtime_error("[ERROR] Set MS_PRIVATE to fs: FAILED " + std::to_string(errno) + "]");
 
-        // Mounts the overlay fs
-        std::cout << "Mounting overlay fs " << container->rootfs << std::endl;
-        std::string imageRootDir = container->rootDir + "/cache/" + container->distroName + "/rootfs";
-        std::string upperDir = container->dir + "/copy-on-write";
-        std::string workDir = container->dir + "/work";
-        std::string mountData = "lowerdir=" + imageRootDir + ",upperdir=" + upperDir + ",workdir=" + workDir;
-        if (mount("overlay", container->rootfs.c_str(), "overlay", MS_NODEV, mountData.c_str()) != 0)
-            throw std::runtime_error("[ERROR] Mount overlay fs: FAILED");
-        std::cout << "Mounting overlay fs " << container->rootfs << ": SUCCESS" << std::endl;
-
+        mountOverlayFileSystem(container);
         pivotRoot(container);
         mountDirectories(container);
+        setUpDev(container);
         setUpVariables(container);
         return true;
     }
@@ -327,9 +412,13 @@ bool enterContainment(Container* container)
  */
 void unmountDirectories()
 {
-    std::cout << "Unmounting directories: proc" << std::endl;
-    if (umount("proc") != 0)
-        throw std::runtime_error("[ERROR] Unmount /proc: FAILED [Errno " + std::to_string(errno) + "]");
+    std::cout << "Unmounting directories: proc, sys, dev" << std::endl;
+    std::vector<std::string> dirs = { "/proc", "/sys", "/dev/pts", "/dev" };
+    for (const auto& dir : dirs)
+    {
+        if (umount(dir.c_str()) != 0)
+            throw std::runtime_error("[ERROR] Unmount " + dir + ": FAILED [Errno " + std::to_string(errno) + "]");
+    }
 
     std::cout << "Unmounting directories: SUCCESS" << std::endl;
 }
@@ -345,9 +434,12 @@ void exitContainment(Container* container)
 }
 
 
-
 /**
- * @param arg: a pointer to the Container struct which represents the container will be run.
+ * Runs the container by invoking the system() function. Initializes the containerized
+ * environment with the enterContainment() function. Performs actions listed in
+ * exitContainment() upon exiting the container.
+ *
+ * @param arg: pointer to the Container struct which represents the container will be run.
  */
 int execute(void* arg)
 {
