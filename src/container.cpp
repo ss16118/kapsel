@@ -15,6 +15,9 @@
 
 #include "constants.h"
 #include "container.h"
+#include "utils.h"
+
+const std::string CGROUP_FOLDER = "/sys/fs/cgroup";
 
 /**
  * A struct representing a linux device file.
@@ -227,6 +230,57 @@ char* createStack(const uint32_t stackSize = 65536)
     return stack + stackSize;
 }
 
+
+/**
+ * Limits the number of process the container can create by
+ * creating a directory in cgroup's 'pids' folder and writing
+ * the limit to the corresponding files.
+ *
+ * Implementation from:
+ * https://github.com/cesarvr/container/blob/master/container.cc
+ */
+void setUpProcessLimit(Container* container)
+{
+
+    std::string pidDir = CGROUP_FOLDER + "/pids/" + container->id;
+    if (mkdir(pidDir.c_str(), S_IRUSR | S_IWUSR) < 0)
+        throw std::runtime_error("[ERROR] Create directory " + pidDir + ": FAILED [Errno " + std::to_string(errno) + "]");
+
+    if (!appendToFile(pidDir + "/pids.max", "20"))
+        throw std::runtime_error("[ERROR] Write to file pids.max: FAILED");
+    if (!appendToFile(pidDir + "/notify_on_release", "1"))
+        throw std::runtime_error("[ERROR] Write to file notify_on_release: FAILED");
+    if (!appendToFile(pidDir + "/cgroup.procs", std::to_string(container->pid)))
+        throw std::runtime_error("[ERROR] Write to cgroup.procs: FAILED");
+}
+
+
+void setUpMemoryLimit(Container* container)
+{
+
+}
+
+
+void setUpCpuLimit(Container* container)
+{
+
+}
+
+
+/**
+ * Initializes the amount of computing resources to which the container has access
+ * (e.g. memory, cpu, number of processes, etc).
+ */
+void setUpResourceLimits(Container* container)
+{
+
+    std::cout << "Setting up container resource limits" << std::endl;
+    setUpProcessLimit(container);
+    setUpMemoryLimit(container);
+    setUpCpuLimit(container);
+    std::cout << "Set up container resource limits: SUCCESS" << std::endl;
+}
+
 /**
  * Mounts the overlay fs of the given container so that the rootfs archive does
  * not have to be unpacked every time a new container is created. More details can
@@ -355,9 +409,6 @@ void setUpVariables(Container* container)
 {
     clearenv();
 
-    // Sets the new hostname to be the ID of the container
-    sethostname(container->id.c_str(), container->id.length());
-
     setenv("HOME", "/", 0);
     setenv("DISPLAY", ":0.0", 0);
     setenv("TERM", "xterm-256color", 0);
@@ -368,21 +419,26 @@ void setUpVariables(Container* container)
 /**
  * Initializes a containerized environment in which the given Container will be run.
  * Performs the following actions in order upon entering the execute() function:
- * 1. Mounts the root mount as private and recursively so that the sub-mounts will
+ * 1. Initializes all the resource limits of the container (e.g. memory, process, etc).
+ * 2. Mounts the root mount as private and recursively so that the sub-mounts will
  * not be visible to the parent mount.
- * 2. Mounts the overlay file system.
- * 3. Changes the root file system uses pivot_root(). This step has the effect as
+ * 3. Mounts the overlay file system.
+ * 4. Changes the root file system uses pivot_root(). This step has the effect as
  * performing chroot, except for the fact that it is more secure.
- * 4. Mounts the a list of required directories to the root file system in the container.
- * 5. Creates and sets up basic devices in the container.
- * 6. Sets up the environment variables in the container.
+ * 5. Mounts the a list of required directories to the root file system in the container.
+ * 6. Creates and sets up basic devices in the container.
+ * 7. Sets up the environment variables in the container.
+ * 8. Changes the host name of the container
  * @return true if the all containment actions have been performed successfully, false otherwise.
  */
 bool enterContainment(Container* container)
 {
-    std::cout << "Initializing container " << container->id << std::endl;
+    std::cout << "Initializing container " << container->id << " with pid " << container->pid << std::endl;
     try
     {
+
+        setUpResourceLimits(container);
+
         // From:
         // https://github.com/swetland/mkbox/blob/master/mkbox.c
         // https://github.com/dmitrievanthony/sprat/blob/master/src/container.c
@@ -396,6 +452,8 @@ bool enterContainment(Container* container)
         mountDirectories(container);
         setUpDev(container);
         setUpVariables(container);
+        // Sets the new hostname to be the ID of the container
+        sethostname(container->id.c_str(), container->id.length());
         return true;
     }
     catch (std::exception& ex)
@@ -466,6 +524,7 @@ int execute(void* arg)
  */
 void startContainer(Container* container)
 {
+    container->pid = getpid();
     int flags = CLONE_NEWPID | CLONE_NEWUTS | SIGCHLD | CLONE_NEWNS;
     char* childStack = createStack();
     int pid = clone(execute, childStack, flags, (void*) container);
@@ -483,6 +542,29 @@ void startContainer(Container* container)
         std::cout << "Container " << container->id << " exit status: " << WEXITSTATUS(exitStatus) << std::endl;
 }
 
+
+/**
+ *
+ * @param container
+ */
+void removeCGroupDirs(Container* container)
+{
+    std::cout << "Removing CGroup folders of container" << container->id << std::endl;
+    std::vector<std::string> dirs = {
+            CGROUP_FOLDER + "/pids/" + container->id
+    };
+    for (const auto& dir : dirs)
+    {
+        // FIXME Only rmdir can remove the directory in cgroup, yet it always has an errno of 21
+        if (rmdir(dir.c_str()) < 0 && errno != 21)
+            throw std::runtime_error(
+                    "[ERROR] Remove directory " + dir + ": FAILED [Errno " + std::to_string(errno) + "]" );
+
+    }
+    std::cout << "Remove CGroup folders: SUCCESS"<< std::endl;
+}
+
+
 /**
  * Removes the directory that contains the file system of the given Container.
  */
@@ -493,7 +575,7 @@ void removeContainerDirectory(Container* container)
     std::error_code errorCode;
     if (!std::filesystem::remove_all(containerDir, errorCode))
     {
-        throw std::runtime_error("[ERROR] Failed to remove directory " + containerDir + ": " + errorCode.message());
+        throw std::runtime_error("[ERROR] Remove directory " + containerDir + ": FAILED " + errorCode.message());
     }
     std::cout << "Removing " << containerDir << ": SUCCESS" << std::endl;
 }
@@ -501,8 +583,8 @@ void removeContainerDirectory(Container* container)
 /**
  * Cleans up the system after a container finishes running.
  * Performs the following actions:
- * 1. Unmounts the overlay fs.
- * 2. Deletes the container rootfs directory.
+ * 1. Deletes the container rootfs directory.
+ * 2. Removes the container-associated folders created in the cgroup folder.
  * 3. Deallocates the memory taken up by the given Container struct.
  * @return true if clean up succeeds, false otherwise.
  */
@@ -513,6 +595,7 @@ bool cleanUpContainer(Container* container)
     try
     {
         removeContainerDirectory(container);
+        removeCGroupDirs(container);
         delete container;
         std::cout << "Clean up container " << containerId << ": SUCCESS" << std::endl;
         return true;

@@ -5,14 +5,16 @@
 #include <string>
 #include <random>
 #include <unistd.h>
+#include <sstream>
+#include <fstream>
 
 /**
  * Checks if a string ends with the given suffix. Returns true if it does, false otherwise.
  * Implementation from:
  * https://stackoverflow.com/questions/874134/find-out-if-string-ends-with-another-string-in-c
  *
- * @param fullString: the string whose ending will be checked.
- * @param suffix: the potential suffix of the full string.
+ * @param fullString the string whose ending will be checked.
+ * @param suffix the potential suffix of the full string.
  */
 bool endsWith(const std::string& fullString, const std::string& suffix)
 {
@@ -29,7 +31,7 @@ bool endsWith(const std::string& fullString, const std::string& suffix)
  * Implementation based on:
  * https://stackoverflow.com/questions/440133/how-do-i-create-a-random-alpha-numeric-string-in-c
  *
- * @return: a randomly generated container ID with the given length;
+ * @return a randomly generated container ID with the given length;
  */
 std::string generateContainerId(size_t length)
 {
@@ -50,3 +52,19 @@ std::string generateContainerId(size_t length)
     return randomId;
 }
 
+
+/**
+ * Appends the given text to the file specified by the given file path.
+ * @return if action has been successful, returns true. Otherwise, returns false.
+ */
+bool appendToFile(const std::string filePath, const std::string text)
+{
+    std::ofstream file;
+    file.open(filePath, std::ios::out | std::ios::app);
+    if (file.fail())
+        return false;
+
+    file << text;
+    file.close();
+    return true;
+}

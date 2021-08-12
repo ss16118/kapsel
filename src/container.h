@@ -12,6 +12,7 @@
  */
 struct Container
 {
+    pid_t pid;
     std::string distroName;
     std::string id;
     std::string rootDir;
