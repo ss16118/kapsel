@@ -243,27 +243,76 @@ void setUpProcessLimit(Container* container)
 {
 
     std::string pidDir = CGROUP_FOLDER + "/pids/" + container->id;
-    if (mkdir(pidDir.c_str(), S_IRUSR | S_IWUSR) < 0)
-        throw std::runtime_error("[ERROR] Create directory " + pidDir + ": FAILED [Errno " + std::to_string(errno) + "]");
+    if (!std::filesystem::create_directories(pidDir))
+        throw std::runtime_error("[ERROR] Create directory " + pidDir + ": FAILED");
+
 
     if (!appendToFile(pidDir + "/pids.max", "20"))
-        throw std::runtime_error("[ERROR] Write to file pids.max: FAILED");
+        throw std::runtime_error("[ERROR] Write to file 'pids.max': FAILED");
     if (!appendToFile(pidDir + "/notify_on_release", "1"))
-        throw std::runtime_error("[ERROR] Write to file notify_on_release: FAILED");
+        throw std::runtime_error("[ERROR] Write to file 'notify_on_release': FAILED");
     if (!appendToFile(pidDir + "/cgroup.procs", std::to_string(container->pid)))
-        throw std::runtime_error("[ERROR] Write to cgroup.procs: FAILED");
+        throw std::runtime_error("[ERROR] Write to 'cgroup.procs': FAILED");
 }
 
-
+/**
+ * Limits the memory usage of the container by creating a
+ * directory in the cgroup's memory folder and moving the
+ * process to the 'tasks' file and then writing the limits
+ * to the following files:
+ * - memory.limit_in_bytes
+ * - memory.memsw.limit_in_bytes
+ *
+ * To read more about the memory CGroup and subsystem, please check
+ * out the following link:
+ * https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/6/html/resource_management_guide/sec-memory
+ *
+ *
+ * Implementation from:
+ * https://github.com/Fewbytes/rubber-docker/blob/master/levels/10_setuid/rd.py
+ */
 void setUpMemoryLimit(Container* container)
 {
+    std::string memoryDir = CGROUP_FOLDER + "/memory/" + container->id;
+    if (!std::filesystem::create_directories(memoryDir))
+        throw std::runtime_error("[ERROR] Create directory " + memoryDir + ": FAILED");
 
+    // Adds the container's process to the 'tasks' file
+    if (!appendToFile(memoryDir + "/tasks", std::to_string(container->pid)))
+        throw std::runtime_error("[ERROR] Write to file 'tasks': FAILED");
+
+    if (!appendToFile(memoryDir + "/memory.limit_in_bytes", "256m"))
+        throw std::runtime_error("[ERROR] Write to file 'memory.limit_in_bytes': FAILED");
+
+    if (!appendToFile(memoryDir + "/memory.memsw.limit_in_bytes", "256m"))
+        throw std::runtime_error("[ERROR] Write to file 'memory.memsw.limit_in_bytes': FAILED");
 }
 
-
+/**
+ * Limits the CPU usage of the processes inside the container. Imposes a
+ * soft limit by adding the container's process to the 'tasks' file and
+ * writing the allocated share to 'cpu.shares'.
+ * To understand relationship between the allocated shares and the actual
+ * CPU utilization rate, the following links can be used as references:
+ * - https://oakbytes.wordpress.com/2012/09/02/cgroup-cpu-allocation-cpu-shares-examples/
+ * - https://www.batey.info/cgroup-cpu-shares-for-docker.html
+ * - https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/6/html/resource_management_guide/sec-cpu
+ *
+ * Implementation from:
+ * https://github.com/Fewbytes/rubber-docker/blob/master/levels/10_setuid/rd.py
+ */
 void setUpCpuLimit(Container* container)
 {
+    std::string cpuDir = CGROUP_FOLDER + "/cpu/" + container->id;
+    if (!std::filesystem::create_directories(cpuDir))
+        throw std::runtime_error("[ERROR] Create directory " + cpuDir + ": FAILED");
 
+    // Adds the container's process to the 'tasks' file
+    if (!appendToFile(cpuDir + "/tasks", std::to_string(container->pid)))
+        throw std::runtime_error("[ERROR] Write to file 'tasks': FAILED");
+
+    if (!appendToFile(cpuDir + "/cpu.shares", std::to_string(512)))
+        throw std::runtime_error("[ERROR] Write to file 'cpu.shares': FAILED");
 }
 
 
@@ -276,8 +325,8 @@ void setUpResourceLimits(Container* container)
 
     std::cout << "Setting up container resource limits" << std::endl;
     setUpProcessLimit(container);
-    setUpMemoryLimit(container);
     setUpCpuLimit(container);
+    setUpMemoryLimit(container);
     std::cout << "Set up container resource limits: SUCCESS" << std::endl;
 }
 
@@ -433,7 +482,7 @@ void setUpVariables(Container* container)
  */
 bool enterContainment(Container* container)
 {
-    std::cout << "Initializing container " << container->id << " with pid " << container->pid << std::endl;
+    std::cout << "Initializing container " << container->id << std::endl;
     try
     {
 
@@ -502,6 +551,7 @@ void exitContainment(Container* container)
 int execute(void* arg)
 {
     auto* container = (Container*) arg;
+    container->pid = getpid();
     if (!enterContainment(container))
         return -1;
 
@@ -524,7 +574,6 @@ int execute(void* arg)
  */
 void startContainer(Container* container)
 {
-    container->pid = getpid();
     int flags = CLONE_NEWPID | CLONE_NEWUTS | SIGCHLD | CLONE_NEWNS;
     char* childStack = createStack();
     int pid = clone(execute, childStack, flags, (void*) container);
@@ -544,17 +593,19 @@ void startContainer(Container* container)
 
 
 /**
- *
- * @param container
+ * Removes the CGroup limitations imposed on the container
+ * for pids, CPU and memory by deleting the corresponding directories
+ * in /sys/fs/cgroup.
  */
 void removeCGroupDirs(Container* container)
 {
     std::cout << "Removing CGroup folders of container" << container->id << std::endl;
-    std::vector<std::string> dirs = {
-            CGROUP_FOLDER + "/pids/" + container->id
+    std::vector<std::string> resources = {
+            "pids", "memory", "cpu"
     };
-    for (const auto& dir : dirs)
+    for (const auto& resource : resources)
     {
+        std::string dir = CGROUP_FOLDER + "/" + resource + "/" + container->id;
         // FIXME Only rmdir can remove the directory in cgroup, yet it always has an errno of 21
         if (rmdir(dir.c_str()) < 0 && errno != 21)
             throw std::runtime_error(

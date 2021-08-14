@@ -5,8 +5,8 @@
 #include <string>
 #include <random>
 #include <unistd.h>
-#include <sstream>
 #include <fstream>
+#include <iostream>
 
 /**
  * Checks if a string ends with the given suffix. Returns true if it does, false otherwise.
