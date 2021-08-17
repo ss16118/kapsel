@@ -1,10 +1,8 @@
 #include <iostream>
 #include <vector>
-#include <unistd.h>
 #include <string>
 #include <filesystem>
 #include <cxxopts/cxxopts.hpp>
-#include <wait.h>
 
 #include "container.h"
 #include "constants.h"
@@ -12,11 +10,6 @@
 
 std::map<std::string, CommandType> stringToCommandType = {
         { "run", Run }
-};
-
-std::map<std::string, Distro> stringToDistro = {
-        { "ubuntu", Ubuntu },
-        { "alpine", Alpine }
 };
 
 /**

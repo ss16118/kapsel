@@ -3,6 +3,7 @@
 //
 #include <string>
 #include <iostream>
+#include <utility>
 #include <sys/mount.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
@@ -18,6 +19,15 @@
 #include "utils.h"
 
 const std::string CGROUP_FOLDER = "/sys/fs/cgroup";
+const std::string BRIDGE_NAME = "kapsel";
+const std::pair<std::string, std::string> VETH_NAMES{ "veth1", "veth2" };
+
+std::map<std::string, std::string> stringToDownloadUrl = {
+        { "ubuntu", UBUNTU_IMAGE_URL },
+        { "alpine", ALPINE_IMAGE_URL },
+        { "centos", CENTOS_IMAGE_URL },
+        { "arch", ARCH_IMAGE_URL }
+};
 
 /**
  * A struct representing a linux device file.
@@ -96,18 +106,9 @@ void setUpContainerImage(Container* container)
             throw std::runtime_error("[ERROR] Failed to create cache directory " + cacheDir);
     }
 
-    Distro distro = stringToDistro[container->distroName];
-    std::string downloadUrl;
-    switch (distro)
-    {
-        case Ubuntu:
-            downloadUrl = UBUNTU_IMAGE_URL;
-            break;
 
-        case Alpine:
-            downloadUrl = ALPINE_IMAGE_URL;
-            break;
-    }
+    std::string downloadUrl = stringToDownloadUrl[container->distroName];
+
     std::string baseArchiveName(basename(downloadUrl.c_str()));
     std::string rootfsArchive = cacheDir + "/" + baseArchiveName;
 
@@ -119,7 +120,7 @@ void setUpContainerImage(Container* container)
         std::cout << "Rootfs for " + container->distroName + " does not exist." << std::endl;
         std::cout << "Downloading " + baseArchiveName + " from " + downloadUrl << std::endl;
         sprintf(buffer, "wget -O %s %s -q --show-progress", rootfsArchive.c_str(), downloadUrl.c_str());
-        if (system(buffer) != 0)
+        if (system(buffer) == -1)
             throw std::runtime_error("[ERROR] Download rootfs archive for " + distroName + ": FAILED");
     }
 
@@ -134,8 +135,8 @@ void setUpContainerImage(Container* container)
 
         // Extracts the files
         std::cout << "Extracting rootfs from " << rootfsArchive << " to " << imageRootDir << std::endl;
-        sprintf(buffer, "tar xzvf %s -C %s > /dev/null", rootfsArchive.c_str(), imageRootDir.c_str());
-        if (system(buffer) != 0)
+        sprintf(buffer, "tar xvf %s -C %s > /dev/null", rootfsArchive.c_str(), imageRootDir.c_str());
+        if (system(buffer) == -1)
             throw std::runtime_error("[ERROR] Extract " + rootfsArchive + " to " + imageRootDir + ": FAILED");
     }
 }
@@ -180,7 +181,7 @@ void setUpContainerDirectory(Container* container)
 
         // Makes the current user the owner of the container directory
         sprintf(buffer, "chown -R %s %s", currentUser.c_str(), containerDir.c_str());
-        if (system(buffer) != 0)
+        if (system(buffer) == -1)
             throw std::runtime_error("[ERROR] Make" + currentUser + " the owner of " + containerDir + ": FAILED");
         else
             std::cout << "Setting the owner of " + containerDir + " to " + currentUser << std::endl;
@@ -188,10 +189,50 @@ void setUpContainerDirectory(Container* container)
 }
 
 /**
+ * Initializes the networking environment for the given container by
+ * performing the following actions:
+ * 1. If not already present, creates a new network bridge interface named 'kapsel'
+ * and sets its status to 'up'.
+ * 2. Adds the container's id as a new network namespace by calling 'ip netns add'.
+ * 3. Creates a new pair of veths.
+ * References:
+ * - https://dev.to/polarbit/how-docker-container-networking-works-mimic-it-using-linux-network-namespaces-9mj
+ */
+void initializeContainerNetwork(Container* container)
+{
+    std::cout << "Initializing container network environment" << std::endl;
+    std::vector<std::string> commands = {
+            // Adds the container's ID as a new network namespace
+            "ip netns add " + container->id,
+            // Creates a veth pair
+            "ip link add " +  VETH_NAMES.first + " type veth peer name " + VETH_NAMES.second
+    };
+
+    // Checks if the bridge 'kapsel' already exists
+    std::string bridgeFilePath = "/sys/class/net/" + BRIDGE_NAME + "/bridge";
+    if (!std::filesystem::exists(bridgeFilePath))
+    {
+        commands.insert(commands.begin(), "ip link set " + BRIDGE_NAME + " up");
+        commands.insert(commands.begin(), "ip link add name " + BRIDGE_NAME + " type bridge");
+    }
+
+    for (const auto& command : commands)
+    {
+        if (system(command.c_str()) == -1)
+            throw std::runtime_error("[ERROR] Execute command " + command + ": FAILED");
+    }
+
+    std::cout << "Initialize container network environment: SUCCESS" << std::endl;
+}
+
+
+
+/**
  * Prepares and sets up the environment required for the container to
  * run correctly. Performs the following actions:
  * 1. Downloads and extracts the rootfs to the specified folder.
  * 2. Initializes the overlay fs folders in the container's directory.
+ * 3. Initializes the networking environment for the given container.
  *
  * @param container a struct representing the container whose file system will initialized.
  * @return true if set up succeeds, false otherwise.
@@ -203,6 +244,7 @@ bool setUpContainer(Container* container)
     {
         setUpContainerImage(container);
         setUpContainerDirectory(container);
+        initializeContainerNetwork(container);
         std::cout << "Set up container " << container->id << ": SUCCESS" << std::endl;
         return true;
     }
@@ -262,8 +304,9 @@ void setUpProcessLimit(Container* container)
  * to the following files:
  * - memory.limit_in_bytes
  * - memory.memsw.limit_in_bytes
- *
- * To read more about the memory CGroup and subsystem, please check
+ * Can be tested with:
+ * dd if=/dev/zero of=output.dat  bs=24M  count=1
+ * To read more about the memory cgroup and subsystem, please check
  * out the following link:
  * https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/6/html/resource_management_guide/sec-memory
  *
@@ -330,6 +373,28 @@ void setUpResourceLimits(Container* container)
     std::cout << "Set up container resource limits: SUCCESS" << std::endl;
 }
 
+
+/**
+ * Registers the network namespace of the container by bind-mounting /proc/<pid>/ns/net
+ * to /var/run/netns/<container_id>.
+ *
+ * References:
+ * - https://gist.github.com/cfra/39f4110366fa1ae9b1bddd1b47f586a3
+ * - https://www.schutzwerk.com/en/43/posts/namespaces_03_pid_net/
+ */
+void setUpNetworkNamespace(Container* container)
+{
+    std::cout << "Setting up network namespace" << std::endl;
+
+    // std::string procNetPath = "/proc/" + std::to_string(container->pid) + "/ns/net";
+    std::string procNetPath = "/proc/self/ns/net";
+    std::string networkNamespacePath = "/var/run/netns/" + container->id;
+    if (mount(procNetPath.c_str(), networkNamespacePath.c_str(), nullptr, MS_BIND, nullptr) != 0)
+        throw std::runtime_error("[ERROR] Register network namespace with mount: FAILED [Errno " + std::to_string(errno) + "]");
+
+    std::cout << "Set up network namespace: SUCCESS" << std::endl;
+}
+
 /**
  * Mounts the overlay fs of the given container so that the rootfs archive does
  * not have to be unpacked every time a new container is created. More details can
@@ -362,7 +427,7 @@ void pivotRoot(Container* container)
     if(!std::filesystem::create_directories(tempDir))
         throw std::runtime_error("[ERROR] Create temp directory " + tempDir + ": FAILED");
 
-    if (pivot_root(container->rootfs.c_str(), tempDir.c_str()) < 0)
+    if (pivot_root(container->rootfs.c_str(), tempDir.c_str()) != 0)
         throw std::runtime_error("[ERROR] Pivot root: FAILED");
 
     chdir("/");
@@ -371,7 +436,7 @@ void pivotRoot(Container* container)
     if (umount2("/temp", MNT_DETACH))
         throw std::runtime_error("[ERROR] Unmount temp directory: FAILED [Errno " + std::to_string(errno) + "]");
 
-    if (rmdir("/temp") < 0)
+    if (rmdir("/temp") != 0)
         throw std::runtime_error("[ERROR] Remove temp directory: FAILED [Errno " + std::to_string(errno) + "]");
 
     std::cout << "Perform pivot root: SUCCESS" << std::endl;
@@ -421,13 +486,13 @@ void setUpDev(Container* container)
 
     // Creates symlinks for stdin, stdout and stderr
     std::vector<std::string> streams = { "stdin", "stdout", "stderr" };
-    if (symlink("/proc/self/fd", (devDir + "fd").c_str()) < 0)
+    if (symlink("/proc/self/fd", (devDir + "fd").c_str()) != 0)
         throw std::runtime_error("[ERROR] Create symlink for fd: FAILED [" + std::to_string(errno) + "]");
 
     for (std::size_t i = 0; i < streams.size(); i++)
     {
         std::string stream = streams.at(i);
-        if (symlink(("/proc/self/fd/" + std::to_string(i)).c_str(), (devDir + stream).c_str()) < 0)
+        if (symlink(("/proc/self/fd/" + std::to_string(i)).c_str(), (devDir + stream).c_str()) != 0)
             throw std::runtime_error("[ERROR] Create symlink for " + stream + ": FAILED [" + std::to_string(errno) + "]");
     }
 
@@ -443,7 +508,7 @@ void setUpDev(Container* container)
 
     for (const auto& dev : devs)
     {
-        if (mknod((devDir + dev.name).c_str(), 0666 | dev.type, makedev(dev.major, dev.minor)) < 0)
+        if (mknod((devDir + dev.name).c_str(), 0666 | dev.type, makedev(dev.major, dev.minor)) != 0)
             throw std::runtime_error("[ERROR] Create device " + dev.name + ": FAILED [" + std::to_string(errno) + "]");
     }
     std::cout << "Create basic devices: SUCCESS" << std::endl;
@@ -469,15 +534,16 @@ void setUpVariables(Container* container)
  * Initializes a containerized environment in which the given Container will be run.
  * Performs the following actions in order upon entering the execute() function:
  * 1. Initializes all the resource limits of the container (e.g. memory, process, etc).
- * 2. Mounts the root mount as private and recursively so that the sub-mounts will
+ * 2. Sets up network namespace.
+ * 3. Mounts the root mount as private and recursively so that the sub-mounts will
  * not be visible to the parent mount.
- * 3. Mounts the overlay file system.
- * 4. Changes the root file system uses pivot_root(). This step has the effect as
+ * 4. Mounts the overlay file system.
+ * 5. Changes the root file system uses pivot_root(). This step has the effect as
  * performing chroot, except for the fact that it is more secure.
- * 5. Mounts the a list of required directories to the root file system in the container.
- * 6. Creates and sets up basic devices in the container.
- * 7. Sets up the environment variables in the container.
- * 8. Changes the host name of the container
+ * 6. Mounts the a list of required directories to the root file system in the container.
+ * 7. Creates and sets up basic devices in the container.
+ * 8. Sets up the environment variables in the container.
+ * 9. Changes the host name of the container
  * @return true if the all containment actions have been performed successfully, false otherwise.
  */
 bool enterContainment(Container* container)
@@ -487,7 +553,7 @@ bool enterContainment(Container* container)
     {
 
         setUpResourceLimits(container);
-
+        setUpNetworkNamespace(container);
         // From:
         // https://github.com/swetland/mkbox/blob/master/mkbox.c
         // https://github.com/dmitrievanthony/sprat/blob/master/src/container.c
@@ -574,7 +640,8 @@ int execute(void* arg)
  */
 void startContainer(Container* container)
 {
-    int flags = CLONE_NEWPID | CLONE_NEWUTS | SIGCHLD | CLONE_NEWNS;
+    std::cout << "Starting container with pid " << getpid() << std::endl;
+    int flags =  SIGCHLD | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWNET;
     char* childStack = createStack();
     int pid = clone(execute, childStack, flags, (void*) container);
     if (pid < 0)
@@ -593,7 +660,7 @@ void startContainer(Container* container)
 
 
 /**
- * Removes the CGroup limitations imposed on the container
+ * Removes the cgroup limitations imposed on the container
  * for pids, CPU and memory by deleting the corresponding directories
  * in /sys/fs/cgroup.
  */
@@ -608,9 +675,10 @@ void removeCGroupDirs(Container* container)
         std::string dir = CGROUP_FOLDER + "/" + resource + "/" + container->id;
         // FIXME Only rmdir can remove the directory in cgroup, yet it always has an errno of 21
         if (rmdir(dir.c_str()) < 0 && errno != 21)
+        {
             throw std::runtime_error(
-                    "[ERROR] Remove directory " + dir + ": FAILED [Errno " + std::to_string(errno) + "]" );
-
+                    "[ERROR] Remove directory " + dir + ": FAILED [Errno " + std::to_string(errno) + "]");
+        }
     }
     std::cout << "Remove CGroup folders: SUCCESS"<< std::endl;
 }
@@ -631,12 +699,42 @@ void removeContainerDirectory(Container* container)
     std::cout << "Removing " << containerDir << ": SUCCESS" << std::endl;
 }
 
+
+/**
+ * Cleans up the networking environment by performing the following actions:
+ * 1. Unmounts /var/run/netns/<container_id>.
+ * 2. Deletes the network namespace by running 'ip netns del'.
+ * 3. Deletes the veth pair.
+ */
+void cleanUpNetworkEnvironment(Container* container)
+{
+    std::cout << "Removing network namespace" << std::endl;
+
+    std::string networkNamespacePath = "/var/run/netns/" + container->id;
+    if (umount(networkNamespacePath.c_str()) != 0)
+        throw std::runtime_error("[ERROR] Unmount " + networkNamespacePath + ": FAILED [Errno" + std::to_string(errno) + "]");
+
+    std::vector<std::string> commands = {
+            "ip netns del " + container->id,
+            "ip link delete " + VETH_NAMES.first
+    };
+    for (const auto& command : commands)
+    {
+        if (system(command.c_str()) == -1)
+            throw std::runtime_error("[ERROR] Execute command " + command + ": FAILED");
+    }
+
+    std::cout << "Remove network namespace: SUCCESS" << std::endl;
+}
+
+
 /**
  * Cleans up the system after a container finishes running.
  * Performs the following actions:
  * 1. Deletes the container rootfs directory.
  * 2. Removes the container-associated folders created in the cgroup folder.
- * 3. Deallocates the memory taken up by the given Container struct.
+ * 3. Cleans up the networking environment of the container.
+ * 4. Deallocates the memory taken up by the given Container struct.
  * @return true if clean up succeeds, false otherwise.
  */
 bool cleanUpContainer(Container* container)
@@ -647,6 +745,7 @@ bool cleanUpContainer(Container* container)
     {
         removeContainerDirectory(container);
         removeCGroupDirs(container);
+        cleanUpNetworkEnvironment(container);
         delete container;
         std::cout << "Clean up container " << containerId << ": SUCCESS" << std::endl;
         return true;
