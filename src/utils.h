@@ -8,5 +8,7 @@
 bool endsWith(const std::string& fullString, const std::string& suffix);
 std::string generateContainerId(size_t length = 12);
 bool appendToFile(std::string filePath, std::string text);
+std::string getNextIp(std::string baseIp, int iter);
+std::string systemWithOutput(const std::string& command);
 
 #endif //CONTAINER_CPP_UTILS_H

@@ -3,7 +3,6 @@
 //
 #include <string>
 #include <iostream>
-#include <utility>
 #include <sys/mount.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
@@ -13,14 +12,11 @@
 #include <sched.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <algorithm>
 
 #include "constants.h"
 #include "container.h"
 #include "utils.h"
-
-const std::string CGROUP_FOLDER = "/sys/fs/cgroup";
-const std::string BRIDGE_NAME = "kapsel";
-const std::pair<std::string, std::string> VETH_NAMES{ "veth1", "veth2" };
 
 std::map<std::string, std::string> stringToDownloadUrl = {
         { "ubuntu", UBUNTU_IMAGE_URL },
@@ -188,31 +184,87 @@ void setUpContainerDirectory(Container* container)
     }
 }
 
+
+/**
+ * A helper function which retrieves the next available IP address
+ * for the container. Returns an empty string if the operation fails.
+ */
+std::string getContainerVEthIp()
+{
+    try
+    {
+        // Counts the number of containers that already exist by
+        // checking the number of connections to the bridge
+        int connectionCount = std::stoi(systemWithOutput("brctl show " + BRIDGE_NAME + " | grep veth1 | wc -l")) + 1;
+        return getNextIp(BRIDGE_IP, connectionCount);
+    }
+    catch (std::exception& ex)
+    {
+        return std::string();
+    }
+}
+
+
 /**
  * Initializes the networking environment for the given container by
  * performing the following actions:
- * 1. If not already present, creates a new network bridge interface named 'kapsel'
- * and sets its status to 'up'.
+ * 1. If not already present, creates a new network bridge interface named 'kapsel',
+ * sets its status to 'up', and assigns it an IPv4 address.
  * 2. Adds the container's id as a new network namespace by calling 'ip netns add'.
  * 3. Creates a new pair of veths.
+ * 4. Places one end of the veth pair to the new network space.
+ * 5. Moves the other end of the veth pair to the bridge.
+ * 6. Assigns an IPv4 address to veth0.
+ * 7. Ups veth0.
+ * 8. Ups container localhost.
+ * 9. Ups veth1.
+ * 10. Adds the bridge's IP as the default gateway for the container network.
  * References:
  * - https://dev.to/polarbit/how-docker-container-networking-works-mimic-it-using-linux-network-namespaces-9mj
  */
 void initializeContainerNetwork(Container* container)
 {
     std::cout << "Initializing container network environment" << std::endl;
+    std::string newNetworkNs = container->id;
+    // Takes the first 9 characters of the container's ID as the suffix
+    // for the names of the veth pair since a valid interface name contains
+    // less than 16 characters
+    std::string suffix = container->id.substr(0, 9);
+    auto vEthPair = std::make_pair("veth0@" + suffix, "veth1@" + suffix);
+    container->vEthPair = vEthPair;
+    std::string containerIp = getContainerVEthIp();
+    container->ip = containerIp;
+    std::cout << "[DEBUG] Container IP: " << containerIp << std::endl;
     std::vector<std::string> commands = {
             // Adds the container's ID as a new network namespace
-            "ip netns add " + container->id,
+            "ip netns add " + newNetworkNs,
             // Creates a veth pair
-            "ip link add " +  VETH_NAMES.first + " type veth peer name " + VETH_NAMES.second
+            "ip link add " +  vEthPair.first + " type veth peer name " + vEthPair.second,
+            // Moves one end of the veth pair to the new namespace
+            "ip link set " + vEthPair.first + " netns " + newNetworkNs,
+            // Moves the other end of the veth pair to the bridge
+            "ip link set " + vEthPair.second + " master " + BRIDGE_NAME,
+            // Assigns an IPv4 address to the first interface in the veth pair
+            "ip netns exec " + newNetworkNs + " ip addr add " + containerIp + "/24 dev " + vEthPair.first,
+            // Ups veth0
+            "ip netns exec " + newNetworkNs + " ip link set " + vEthPair.first + " up",
+            // Ups the container's localhost
+            "ip netns exec " + newNetworkNs + " ip link set lo up",
+            // Ups veth1
+            "ip link set " + vEthPair.second + " up",
+            // Adds the bridge as the default gateway
+            "ip netns exec " + newNetworkNs + " ip route add default via " + BRIDGE_IP
     };
 
     // Checks if the bridge 'kapsel' already exists
     std::string bridgeFilePath = "/sys/class/net/" + BRIDGE_NAME + "/bridge";
     if (!std::filesystem::exists(bridgeFilePath))
     {
+        // Assigns an IP address to the bridge
+        commands.insert(commands.begin(), "ip addr add " + BRIDGE_IP + "/24 brd + dev " + BRIDGE_NAME);
+        // Ups the bridge interface
         commands.insert(commands.begin(), "ip link set " + BRIDGE_NAME + " up");
+        // Creates a network bridge
         commands.insert(commands.begin(), "ip link add name " + BRIDGE_NAME + " type bridge");
     }
 
@@ -706,9 +758,9 @@ void removeContainerDirectory(Container* container)
  * 2. Deletes the network namespace by running 'ip netns del'.
  * 3. Deletes the veth pair.
  */
-void cleanUpNetworkEnvironment(Container* container)
+void cleanUpContainerNetwork(Container* container)
 {
-    std::cout << "Removing network namespace" << std::endl;
+    std::cout << "Cleaning up container network environment" << std::endl;
 
     std::string networkNamespacePath = "/var/run/netns/" + container->id;
     if (umount(networkNamespacePath.c_str()) != 0)
@@ -716,7 +768,7 @@ void cleanUpNetworkEnvironment(Container* container)
 
     std::vector<std::string> commands = {
             "ip netns del " + container->id,
-            "ip link delete " + VETH_NAMES.first
+            "ip link delete " + container->vEthPair.second
     };
     for (const auto& command : commands)
     {
@@ -724,7 +776,7 @@ void cleanUpNetworkEnvironment(Container* container)
             throw std::runtime_error("[ERROR] Execute command " + command + ": FAILED");
     }
 
-    std::cout << "Remove network namespace: SUCCESS" << std::endl;
+    std::cout << "Clean up container network environment: SUCCESS" << std::endl;
 }
 
 
@@ -745,7 +797,7 @@ bool cleanUpContainer(Container* container)
     {
         removeContainerDirectory(container);
         removeCGroupDirs(container);
-        cleanUpNetworkEnvironment(container);
+        cleanUpContainerNetwork(container);
         delete container;
         std::cout << "Clean up container " << containerId << ": SUCCESS" << std::endl;
         return true;

@@ -23,4 +23,10 @@ const std::set<std::string> availableDistros = { "ubuntu", "alpine", "centos", "
 
 extern std::map<std::string, std::string> stringToDownloadUrl;
 
+const std::string CGROUP_FOLDER = "/sys/fs/cgroup";
+
+// Networking related constants
+const std::string BRIDGE_NAME = "kapsel";
+const std::string BRIDGE_IP = "107.17.0.1";
+
 #endif //CONTAINER_CPP_CONSTANTS_H

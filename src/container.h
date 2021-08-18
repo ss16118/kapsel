@@ -6,6 +6,7 @@
 #define CONTAINER_CPP_CONTAINER_H
 
 #include <vector>
+#include <utility>
 
 /**
  * A struct representing an individual container.
@@ -20,6 +21,8 @@ struct Container
     std::string rootfs;
     std::string currentUser;
     std::string command;
+    std::string ip;
+    std::pair<std::string, std::string> vEthPair;
 };
 
 bool setUpContainer(Container* container);
