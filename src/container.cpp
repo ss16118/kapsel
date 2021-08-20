@@ -13,6 +13,8 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <algorithm>
+#include <thread>
+#include <fcntl.h>
 
 #include "constants.h"
 #include "container.h"
@@ -71,6 +73,13 @@ Container* createContainer(
     char buffer[128];
     getlogin_r(buffer, 128);
     container->currentUser = std::string(buffer);
+
+    // Initializes network semaphores
+    container->networkNsSemaphore = sem_open(NETWORK_NS_SEM_NAME, O_CREAT, 0600, 0);
+    container->networkInitSemaphore = sem_open(NETWORK_INIT_SEM_NAME, O_CREAT, 0600, 0);
+
+//    container->networkInitSemaphore = new Semaphore();
+//    container->networkNsSemaphore = new Semaphore();
 
     return container;
 }
@@ -230,14 +239,26 @@ void initializeContainerNetwork(Container* container)
     // for the names of the veth pair since a valid interface name contains
     // less than 16 characters
     std::string suffix = container->id.substr(0, 9);
-    auto vEthPair = std::make_pair("veth0@" + suffix, "veth1@" + suffix);
-    container->vEthPair = vEthPair;
+    container->vEthPair = std::make_pair("veth0@" + suffix, "veth1@" + suffix);
+    auto vEthPair = container->vEthPair;
+
     std::string containerIp = getContainerVEthIp();
-    container->ip = containerIp;
+
     std::cout << "[DEBUG] Container IP: " << containerIp << std::endl;
+
+    // Adds the container's ID as a new network namespace
+    if (system(("ip netns add " + newNetworkNs).c_str()) == -1)
+        throw std::runtime_error("[ERROR] Create namespace " + newNetworkNs + ": FAILED");
+    // Unblocks the thread that is attempting to mount /var/run/netns/<new-network-ns>
+//    container->networkNsSemaphore->release();
+    // sem_post(sem_open(NETWORK_NS_SEM_NAME, 0));
+    sem_post(container->networkNsSemaphore);
+    // Blocks itself until the container's registers its namespace in setUpNetworkNamespace()
+//    sem_wait(sem_open(NETWORK_INIT_SEM_NAME, 0));
+    sem_wait(container->networkInitSemaphore);
+//    container->networkInitSemaphore->acquire();
+
     std::vector<std::string> commands = {
-            // Adds the container's ID as a new network namespace
-            "ip netns add " + newNetworkNs,
             // Creates a veth pair
             "ip link add " +  vEthPair.first + " type veth peer name " + vEthPair.second,
             // Moves one end of the veth pair to the new namespace
@@ -273,7 +294,8 @@ void initializeContainerNetwork(Container* container)
         if (system(command.c_str()) == -1)
             throw std::runtime_error("[ERROR] Execute command " + command + ": FAILED");
     }
-
+//    container->networkInitSemaphore->release();
+    sem_post(container->networkInitSemaphore);
     std::cout << "Initialize container network environment: SUCCESS" << std::endl;
 }
 
@@ -296,9 +318,7 @@ bool setUpContainer(Container* container)
     {
         setUpContainerImage(container);
         setUpContainerDirectory(container);
-        initializeContainerNetwork(container);
         std::cout << "Set up container " << container->id << ": SUCCESS" << std::endl;
-        return true;
     }
     catch (std::exception& ex)
     {
@@ -306,6 +326,9 @@ bool setUpContainer(Container* container)
         std::cout << ex.what() << std::endl;
         return false;
     }
+    std::thread networkWorker(initializeContainerNetwork, container);
+    networkWorker.detach();
+    return true;
 }
 
 /**
@@ -441,9 +464,17 @@ void setUpNetworkNamespace(Container* container)
     // std::string procNetPath = "/proc/" + std::to_string(container->pid) + "/ns/net";
     std::string procNetPath = "/proc/self/ns/net";
     std::string networkNamespacePath = "/var/run/netns/" + container->id;
+//    container->networkNsSemaphore->acquire();
+//    sem_wait(sem_open(NETWORK_NS_SEM_NAME, 0));
+    sem_wait(container->networkNsSemaphore);
+    std::cout << "[DEBUG] Before network ns mount" << std::endl;
     if (mount(procNetPath.c_str(), networkNamespacePath.c_str(), nullptr, MS_BIND, nullptr) != 0)
         throw std::runtime_error("[ERROR] Register network namespace with mount: FAILED [Errno " + std::to_string(errno) + "]");
+    std::cout << "[DEBUG] After network ns mount" << std::endl;
 
+//    container->networkInitSemaphore->release();
+//    sem_post(sem_open(NETWORK_INIT_SEM_NAME, 0));
+    sem_post(container->networkInitSemaphore);
     std::cout << "Set up network namespace: SUCCESS" << std::endl;
 }
 
@@ -595,7 +626,8 @@ void setUpVariables(Container* container)
  * 6. Mounts the a list of required directories to the root file system in the container.
  * 7. Creates and sets up basic devices in the container.
  * 8. Sets up the environment variables in the container.
- * 9. Changes the host name of the container
+ * 9. Adds name server to resolv.conf.
+ * 10. Changes the host name of the container
  * @return true if the all containment actions have been performed successfully, false otherwise.
  */
 bool enterContainment(Container* container)
@@ -619,9 +651,18 @@ bool enterContainment(Container* container)
         mountDirectories(container);
         setUpDev(container);
         setUpVariables(container);
+        // Adds DNS resolver to resolv.conf
+        appendToFile("/etc/resolv.conf", "nameserver " + DEFAULT_NAMESERVER);
         // Sets the new hostname to be the ID of the container
         sethostname(container->id.c_str(), container->id.length());
-        return true;
+        // Blocks the current thread until network environment initialization is finished
+//        container->networkInitSemaphore->acquire();
+//        sem_t* semaphore = sem_open(NETWORK_INIT_SEM_NAME, 0);
+//        if (semaphore == SEM_FAILED)
+//        {
+//            std::cout << "[DEBUG] ERRNO: " << errno << std::endl;
+//        }
+        sem_wait(container->networkInitSemaphore);
     }
     catch (std::exception& ex)
     {
@@ -629,6 +670,8 @@ bool enterContainment(Container* container)
         std::cout << ex.what() << std::endl;
         return false;
     }
+    std::cout << "Initialize container: SUCCESS" << std::endl;
+    return true;
 }
 
 /**
@@ -707,7 +750,14 @@ void startContainer(Container* container)
     if (waitpid(pid, &exitStatus, 0) == -1)
         std::cout << "[ERROR] waitpid() failed for child process " << pid << std::endl;
     if (WIFEXITED(exitStatus))
+    {
         std::cout << "Container " << container->id << " exit status: " << WEXITSTATUS(exitStatus) << std::endl;
+    }
+    else
+    {
+        // If seg fault happens during the execution
+        std::cout << "[ERROR] Container " << container->id << " exited with status: " << exitStatus << std::endl;
+    }
 }
 
 
@@ -718,7 +768,7 @@ void startContainer(Container* container)
  */
 void removeCGroupDirs(Container* container)
 {
-    std::cout << "Removing CGroup folders of container" << container->id << std::endl;
+    std::cout << "Removing CGroup folders of container " << container->id << std::endl;
     std::vector<std::string> resources = {
             "pids", "memory", "cpu"
     };
@@ -755,8 +805,8 @@ void removeContainerDirectory(Container* container)
 /**
  * Cleans up the networking environment by performing the following actions:
  * 1. Unmounts /var/run/netns/<container_id>.
- * 2. Deletes the network namespace by running 'ip netns del'.
- * 3. Deletes the veth pair.
+ * 2. Deletes the veth pair.
+ * 3. Deletes the network namespace by running 'ip netns del'.
  */
 void cleanUpContainerNetwork(Container* container)
 {
@@ -764,11 +814,11 @@ void cleanUpContainerNetwork(Container* container)
 
     std::string networkNamespacePath = "/var/run/netns/" + container->id;
     if (umount(networkNamespacePath.c_str()) != 0)
-        throw std::runtime_error("[ERROR] Unmount " + networkNamespacePath + ": FAILED [Errno" + std::to_string(errno) + "]");
+        throw std::runtime_error("[ERROR] Unmount " + networkNamespacePath + ": FAILED [Errno " + std::to_string(errno) + "]");
 
     std::vector<std::string> commands = {
-            "ip netns del " + container->id,
-            "ip link delete " + container->vEthPair.second
+            "ip link delete " + container->vEthPair.second,
+            "ip netns del " + container->id
     };
     for (const auto& command : commands)
     {
@@ -786,7 +836,7 @@ void cleanUpContainerNetwork(Container* container)
  * 1. Deletes the container rootfs directory.
  * 2. Removes the container-associated folders created in the cgroup folder.
  * 3. Cleans up the networking environment of the container.
- * 4. Deallocates the memory taken up by the given Container struct.
+ * 4. Deallocates all the memory taken up by the given Container struct.
  * @return true if clean up succeeds, false otherwise.
  */
 bool cleanUpContainer(Container* container)
@@ -798,6 +848,11 @@ bool cleanUpContainer(Container* container)
         removeContainerDirectory(container);
         removeCGroupDirs(container);
         cleanUpContainerNetwork(container);
+
+//        delete container->networkInitSemaphore;
+//        delete container->networkNsSemaphore;
+        sem_destroy(container->networkNsSemaphore);
+        sem_destroy(container->networkInitSemaphore);
         delete container;
         std::cout << "Clean up container " << containerId << ": SUCCESS" << std::endl;
         return true;

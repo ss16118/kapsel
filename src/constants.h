@@ -7,6 +7,9 @@
 #include <map>
 #include <set>
 
+#define NETWORK_NS_SEM_NAME "/networkNsSemaphore"
+#define NETWORK_INIT_SEM_NAME "/networkInitSemaphore"
+
 enum CommandType {
     Run
 };
@@ -28,5 +31,6 @@ const std::string CGROUP_FOLDER = "/sys/fs/cgroup";
 // Networking related constants
 const std::string BRIDGE_NAME = "kapsel";
 const std::string BRIDGE_IP = "107.17.0.1";
+const std::string DEFAULT_NAMESERVER = "8.8.8.8";
 
 #endif //CONTAINER_CPP_CONSTANTS_H

@@ -7,6 +7,8 @@
 
 #include <vector>
 #include <utility>
+#include <semaphore.h>
+//#include "semaphore.h"
 
 /**
  * A struct representing an individual container.
@@ -21,8 +23,11 @@ struct Container
     std::string rootfs;
     std::string currentUser;
     std::string command;
-    std::string ip;
     std::pair<std::string, std::string> vEthPair;
+    sem_t* networkNsSemaphore;
+    sem_t* networkInitSemaphore;
+//    Semaphore* networkNsSemaphore;
+//    Semaphore* networkInitSemaphore;
 };
 
 bool setUpContainer(Container* container);
