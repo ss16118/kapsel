@@ -8,7 +8,19 @@
 #include <vector>
 #include <utility>
 #include <semaphore.h>
-//#include "semaphore.h"
+
+/**
+ * A struct representing the resource constraints
+ * inside the container.
+ */
+struct ResourceLimits
+{
+    std::string processNumber;
+    int cpuShare;
+    std::string memory;
+    std::string swapMemory;
+};
+
 
 /**
  * A struct representing an individual container.
@@ -24,13 +36,18 @@ struct Container
     std::string currentUser;
     std::string command;
     std::pair<std::string, std::string> vEthPair;
+    ResourceLimits* resourceLimits;
     sem_t* networkNsSemaphore;
     sem_t* networkInitSemaphore;
 };
 
 bool setUpContainer(Container* container);
 bool cleanUpContainer(Container* container);
-Container* createContainer(std::string& distroName, std::string& containerId, std::string& rootDir, std::string& command);
+Container* createContainer(std::string& distroName,
+                           std::string& containerId,
+                           std::string& rootDir,
+                           std::string& command,
+                           ResourceLimits* resourceLimits);
 void startContainer(Container* container);
 
 #endif //CONTAINER_CPP_CONTAINER_H

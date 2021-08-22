@@ -62,7 +62,8 @@ Container* createContainer(
         std::string& distroName,
         std::string& containerId,
         std::string& rootDir,
-        std::string& command)
+        std::string& command,
+        ResourceLimits* resourceLimits)
 {
     auto* container = new Container;
     container->distroName = distroName;
@@ -74,6 +75,7 @@ Container* createContainer(
     char buffer[128];
     getlogin_r(buffer, 128);
     container->currentUser = std::string(buffer);
+    container->resourceLimits = resourceLimits;
 
     // Initializes network semaphores
     // Uses sem_open to create the semaphores since they will be shared among processes
@@ -389,12 +391,15 @@ void setUpProcessLimit(Container* container)
         throw std::runtime_error("Create directory " + pidDir + ": FAILED");
 
 
-    if (!appendToFile(pidDir + "/pids.max", "20"))
+    if (!appendToFile(pidDir + "/pids.max", container->resourceLimits->processNumber))
         throw std::runtime_error("Write to file 'pids.max': FAILED");
+
     if (!appendToFile(pidDir + "/notify_on_release", "1"))
         throw std::runtime_error("Write to file 'notify_on_release': FAILED");
+
     if (!appendToFile(pidDir + "/cgroup.procs", std::to_string(container->pid)))
         throw std::runtime_error("Write to 'cgroup.procs': FAILED");
+
     LOG_F(INFO, "Set up pid limits: SUCCESS");
 }
 
@@ -411,7 +416,6 @@ void setUpProcessLimit(Container* container)
  * out the following link:
  * https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/6/html/resource_management_guide/sec-memory
  *
- *
  * Implementation from:
  * https://github.com/Fewbytes/rubber-docker/blob/master/levels/10_setuid/rd.py
  */
@@ -426,10 +430,10 @@ void setUpMemoryLimit(Container* container)
     if (!appendToFile(memoryDir + "/tasks", std::to_string(container->pid)))
         throw std::runtime_error("Write to file 'tasks': FAILED");
 
-    if (!appendToFile(memoryDir + "/memory.limit_in_bytes", "256m"))
+    if (!appendToFile(memoryDir + "/memory.limit_in_bytes", container->resourceLimits->memory))
         throw std::runtime_error("Write to file 'memory.limit_in_bytes': FAILED");
 
-    if (!appendToFile(memoryDir + "/memory.memsw.limit_in_bytes", "256m"))
+    if (!appendToFile(memoryDir + "/memory.memsw.limit_in_bytes", container->resourceLimits->swapMemory))
         throw std::runtime_error("Write to file 'memory.memsw.limit_in_bytes': FAILED");
 
     LOG_F(INFO, "Set up memory limits: SUCCESS");
@@ -459,7 +463,7 @@ void setUpCpuLimit(Container* container)
     if (!appendToFile(cpuDir + "/tasks", std::to_string(container->pid)))
         throw std::runtime_error("Write to file 'tasks': FAILED");
 
-    if (!appendToFile(cpuDir + "/cpu.shares", std::to_string(512)))
+    if (!appendToFile(cpuDir + "/cpu.shares", std::to_string(container->resourceLimits->cpuShare)))
         throw std::runtime_error("Write to file 'cpu.shares': FAILED");
 
     LOG_F(INFO, "Set up CPU limits: SUCCESS");
@@ -472,7 +476,6 @@ void setUpCpuLimit(Container* container)
  */
 void setUpResourceLimits(Container* container)
 {
-
     LOG_F(INFO, "Setting up container resource limits");
     setUpProcessLimit(container);
     setUpCpuLimit(container);
@@ -875,6 +878,20 @@ void cleanUpContainerNetwork(Container* container)
     LOG_F(INFO, "Clean up container network environment: SUCCESS");
 }
 
+/**
+ * Frees all resources occupied by the given container struct.
+ */
+void destroyContainer(Container* container)
+{
+    delete container->resourceLimits;
+
+    sem_close(container->networkNsSemaphore);
+    sem_unlink(NETWORK_INIT_SEM_NAME);
+    sem_close(container->networkInitSemaphore);
+    sem_unlink(NETWORK_NS_SEM_NAME);
+
+    delete container;
+}
 
 /**
  * Cleans up the system after a container finishes running.
@@ -894,12 +911,8 @@ bool cleanUpContainer(Container* container)
         removeContainerDirectory(container);
         removeCGroupDirs(container);
         cleanUpContainerNetwork(container);
-
-        sem_close(container->networkNsSemaphore);
-        sem_unlink(NETWORK_INIT_SEM_NAME);
-        sem_close(container->networkInitSemaphore);
-        sem_unlink(NETWORK_NS_SEM_NAME);
-        delete container;
+        destroyContainer(container);
+        std::cout << "Container " << containerId << " destroyed" << std::endl;
         LOG_F(INFO, "Clean up container %s: SUCCESS", containerId.c_str());
         return true;
     }
