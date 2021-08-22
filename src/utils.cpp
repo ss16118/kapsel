@@ -84,7 +84,7 @@ bool appendToFile(const std::string filePath, const std::string text)
 std::string getNextIp(std::string baseIp, const int iter = 1)
 {
     std::string nextIp = std::move(baseIp);
-    for (int i = 0; i < iter; i ++)
+    for (int i = 0; i < iter; i++)
     {
         // convert the input IP address to an integer
         in_addr_t address = inet_addr(nextIp.c_str());

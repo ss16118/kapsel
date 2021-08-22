@@ -26,8 +26,6 @@ struct Container
     std::pair<std::string, std::string> vEthPair;
     sem_t* networkNsSemaphore;
     sem_t* networkInitSemaphore;
-//    Semaphore* networkNsSemaphore;
-//    Semaphore* networkInitSemaphore;
 };
 
 bool setUpContainer(Container* container);

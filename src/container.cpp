@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <thread>
 #include <fcntl.h>
+#include <loguru/loguru.hpp>
 
 #include "constants.h"
 #include "container.h"
@@ -75,11 +76,9 @@ Container* createContainer(
     container->currentUser = std::string(buffer);
 
     // Initializes network semaphores
-    container->networkNsSemaphore = sem_open(NETWORK_NS_SEM_NAME, O_CREAT, 0600, 0);
-    container->networkInitSemaphore = sem_open(NETWORK_INIT_SEM_NAME, O_CREAT, 0600, 0);
-
-//    container->networkInitSemaphore = new Semaphore();
-//    container->networkNsSemaphore = new Semaphore();
+    // Uses sem_open to create the semaphores since they will be shared among processes
+    container->networkNsSemaphore = sem_open(NETWORK_NS_SEM_NAME, O_CREAT | O_EXCL, 0600, 0);
+    container->networkInitSemaphore = sem_open(NETWORK_INIT_SEM_NAME, O_CREAT | O_EXCL, 0600, 0);
 
     return container;
 }
@@ -108,7 +107,7 @@ void setUpContainerImage(Container* container)
         if (std::filesystem::create_directories(cacheDir))
             std::cout << "Create cache directory " + cacheDir << ": SUCCESS" << std::endl;
         else
-            throw std::runtime_error("[ERROR] Failed to create cache directory " + cacheDir);
+            throw std::runtime_error("Failed to create cache directory " + cacheDir);
     }
 
 
@@ -122,11 +121,11 @@ void setUpContainerImage(Container* container)
     // Downloads the file system archive if it is not present in the cache directory
     if (!std::filesystem::exists(rootfsArchive))
     {
-        std::cout << "Rootfs for " + container->distroName + " does not exist." << std::endl;
-        std::cout << "Downloading " + baseArchiveName + " from " + downloadUrl << std::endl;
+        LOG_F(INFO, "Rootfs for %s does not exist", container->distroName.c_str());
+        LOG_F(INFO, "Downloading %s from %s", baseArchiveName.c_str(), downloadUrl.c_str());
         sprintf(buffer, "wget -O %s %s -q --show-progress", rootfsArchive.c_str(), downloadUrl.c_str());
         if (system(buffer) == -1)
-            throw std::runtime_error("[ERROR] Download rootfs archive for " + distroName + ": FAILED");
+            throw std::runtime_error("Download rootfs archive for " + distroName + ": FAILED");
     }
 
     // Creates the rootfs folder for the given distro and extracts the archive
@@ -134,15 +133,15 @@ void setUpContainerImage(Container* container)
     if (!std::filesystem::exists(imageRootDir))
     {
         if (std::filesystem::create_directories(imageRootDir))
-            std::cout << "Create directory " + imageRootDir + ": SUCCESS" << std::endl;
+            LOG_F(INFO, "Create directory %s: SUCCESS", imageRootDir.c_str());
         else
-            throw std::runtime_error("[ERROR] Create directory " + imageRootDir + ": FAILED");
+            throw std::runtime_error("Create directory " + imageRootDir + ": FAILED");
 
         // Extracts the files
-        std::cout << "Extracting rootfs from " << rootfsArchive << " to " << imageRootDir << std::endl;
+        LOG_F(INFO, "Extracting rootfs from %s to %s", rootfsArchive.c_str(), imageRootDir.c_str());
         sprintf(buffer, "tar xvf %s -C %s > /dev/null", rootfsArchive.c_str(), imageRootDir.c_str());
         if (system(buffer) == -1)
-            throw std::runtime_error("[ERROR] Extract " + rootfsArchive + " to " + imageRootDir + ": FAILED");
+            throw std::runtime_error("Extract " + rootfsArchive + " to " + imageRootDir + ": FAILED");
     }
 }
 
@@ -167,29 +166,29 @@ void setUpContainerDirectory(Container* container)
     if (!std::filesystem::exists(containerDir))
     {
         if (std::filesystem::create_directories(containerDir))
-            std::cout << "Create container directory " + containerDir + ": SUCCESS" << std::endl;
+            LOG_F(INFO, "Create container directory %s: SUCCESS", containerDir.c_str());
         else
-            throw std::runtime_error("[ERROR] Create container directory " + containerDir + ": FAILED");
+            throw std::runtime_error("Create container directory " + containerDir + ": FAILED");
 
         // Creates copy-on-write (upper), and work directory for the overlay fs
         std::string upperDir = containerDir + "/copy-on-write";
         std::string workDir = containerDir + "/work";
         container->rootfs = containerDir + "/rootfs";
-        std::cout << "Setting up overlay fs directories in " << containerDir << std::endl;
+        LOG_F(INFO, "Setting up overlay fs directories in %s", containerDir.c_str());
         std::vector<std::string> dirs = { upperDir, workDir, container->rootfs };
         for (const auto& dir : dirs)
         {
             if (!std::filesystem::create_directories(dir))
-                throw std::runtime_error("[ERROR] Create " + dir + ": FAILED");
+                throw std::runtime_error("Create " + dir + ": FAILED");
         }
-        std::cout << "Set up overlay fs directories in " << containerDir << ": SUCCESS" << std::endl;
+        LOG_F(INFO, "Set up overlay fs directories in %s: SUCCESS", containerDir.c_str());
 
         // Makes the current user the owner of the container directory
         sprintf(buffer, "chown -R %s %s", currentUser.c_str(), containerDir.c_str());
         if (system(buffer) == -1)
-            throw std::runtime_error("[ERROR] Make" + currentUser + " the owner of " + containerDir + ": FAILED");
+            throw std::runtime_error("Make" + currentUser + " the owner of " + containerDir + ": FAILED");
         else
-            std::cout << "Setting the owner of " + containerDir + " to " + currentUser << std::endl;
+            LOG_F(INFO, "Setting the owner of %s to %s", containerDir.c_str(), currentUser.c_str());
     }
 }
 
@@ -233,70 +232,95 @@ std::string getContainerVEthIp()
  */
 void initializeContainerNetwork(Container* container)
 {
-    std::cout << "Initializing container network environment" << std::endl;
-    std::string newNetworkNs = container->id;
-    // Takes the first 9 characters of the container's ID as the suffix
-    // for the names of the veth pair since a valid interface name contains
-    // less than 16 characters
-    std::string suffix = container->id.substr(0, 9);
-    container->vEthPair = std::make_pair("veth0@" + suffix, "veth1@" + suffix);
-    auto vEthPair = container->vEthPair;
-
-    std::string containerIp = getContainerVEthIp();
-
-    std::cout << "[DEBUG] Container IP: " << containerIp << std::endl;
-
-    // Adds the container's ID as a new network namespace
-    if (system(("ip netns add " + newNetworkNs).c_str()) == -1)
-        throw std::runtime_error("[ERROR] Create namespace " + newNetworkNs + ": FAILED");
-    // Unblocks the thread that is attempting to mount /var/run/netns/<new-network-ns>
-//    container->networkNsSemaphore->release();
-    // sem_post(sem_open(NETWORK_NS_SEM_NAME, 0));
-    sem_post(container->networkNsSemaphore);
-    // Blocks itself until the container's registers its namespace in setUpNetworkNamespace()
-//    sem_wait(sem_open(NETWORK_INIT_SEM_NAME, 0));
-    sem_wait(container->networkInitSemaphore);
-//    container->networkInitSemaphore->acquire();
-
-    std::vector<std::string> commands = {
-            // Creates a veth pair
-            "ip link add " +  vEthPair.first + " type veth peer name " + vEthPair.second,
-            // Moves one end of the veth pair to the new namespace
-            "ip link set " + vEthPair.first + " netns " + newNetworkNs,
-            // Moves the other end of the veth pair to the bridge
-            "ip link set " + vEthPair.second + " master " + BRIDGE_NAME,
-            // Assigns an IPv4 address to the first interface in the veth pair
-            "ip netns exec " + newNetworkNs + " ip addr add " + containerIp + "/24 dev " + vEthPair.first,
-            // Ups veth0
-            "ip netns exec " + newNetworkNs + " ip link set " + vEthPair.first + " up",
-            // Ups the container's localhost
-            "ip netns exec " + newNetworkNs + " ip link set lo up",
-            // Ups veth1
-            "ip link set " + vEthPair.second + " up",
-            // Adds the bridge as the default gateway
-            "ip netns exec " + newNetworkNs + " ip route add default via " + BRIDGE_IP
-    };
-
-    // Checks if the bridge 'kapsel' already exists
-    std::string bridgeFilePath = "/sys/class/net/" + BRIDGE_NAME + "/bridge";
-    if (!std::filesystem::exists(bridgeFilePath))
+    LOG_F(INFO, "Initializing container network environment");
+    try
     {
-        // Assigns an IP address to the bridge
-        commands.insert(commands.begin(), "ip addr add " + BRIDGE_IP + "/24 brd + dev " + BRIDGE_NAME);
-        // Ups the bridge interface
-        commands.insert(commands.begin(), "ip link set " + BRIDGE_NAME + " up");
-        // Creates a network bridge
-        commands.insert(commands.begin(), "ip link add name " + BRIDGE_NAME + " type bridge");
-    }
+        auto* networkNsSemaphore = sem_open(NETWORK_NS_SEM_NAME, 0);
+        if (networkNsSemaphore == SEM_FAILED)
+            throw std::runtime_error("sem_open failed for " + std::string(NETWORK_NS_SEM_NAME));
+        auto* networkInitSemaphore = sem_open(NETWORK_INIT_SEM_NAME, 0);
+        if (networkInitSemaphore == SEM_FAILED)
+            throw std::runtime_error("sem_open failed for " + std::string(NETWORK_INIT_SEM_NAME));
 
-    for (const auto& command : commands)
-    {
-        if (system(command.c_str()) == -1)
-            throw std::runtime_error("[ERROR] Execute command " + command + ": FAILED");
+        std::string newNetworkNs = container->id;
+        // Takes the first 9 characters of the container's ID as the suffix
+        // for the names of the veth pair since a valid interface name contains
+        // less than 16 characters
+        std::string suffix = container->id.substr(0, 9);
+        container->vEthPair = std::make_pair("veth0@" + suffix, "veth1@" + suffix);
+        auto vEthPair = container->vEthPair;
+
+        std::string containerIp = getContainerVEthIp();
+        if (containerIp.empty())
+            throw std::runtime_error("Obtain IPv4 address for container: FAILED");
+        LOG_F(INFO, "Container IP: %s", containerIp.c_str());
+
+        // Adds the container's ID as a new network namespace
+        if (system(("ip netns add " + newNetworkNs).c_str()) == -1)
+            throw std::runtime_error("Create namespace " + newNetworkNs + ": FAILED");
+        // Unblocks the thread that is attempting to mount /var/run/netns/<new-network-ns>
+        sem_post(networkNsSemaphore);
+//        sem_post(sem_open(NETWORK_NS_SEM_NAME, 0));
+        // Blocks itself until the container's registers its namespace in setUpNetworkNamespace()
+        sem_wait(networkInitSemaphore);
+//        sem_wait(sem_open(NETWORK_INIT_SEM_NAME, 0));
+        std::vector<std::string> commands = {
+                // Creates a veth pair
+                "ip link add " +  vEthPair.first + " type veth peer name " + vEthPair.second,
+                // Moves one end of the veth pair to the new namespace
+                "ip link set " + vEthPair.first + " netns " + newNetworkNs,
+                // Moves the other end of the veth pair to the bridge
+                "ip link set " + vEthPair.second + " master " + BRIDGE_NAME,
+                // Assigns an IPv4 address to the first interface in the veth pair
+                "ip netns exec " + newNetworkNs + " ip addr add " + containerIp + "/24 dev " + vEthPair.first,
+                // Ups veth0
+                "ip netns exec " + newNetworkNs + " ip link set " + vEthPair.first + " up",
+                // Ups the container's localhost
+                "ip netns exec " + newNetworkNs + " ip link set lo up",
+                // Ups veth1
+                "ip link set " + vEthPair.second + " up",
+                // Adds the bridge as the default gateway
+                "ip netns exec " + newNetworkNs + " ip route add default via " + BRIDGE_IP
+        };
+
+        // Checks if the bridge 'kapsel' already exists
+        std::string bridgeFilePath = "/sys/class/net/" + BRIDGE_NAME + "/bridge";
+        if (!std::filesystem::exists(bridgeFilePath))
+        {
+            // Changes the policy on IP table
+            // FIXME There might exist another solution
+            // From: https://serverfault.com/questions/694889/cannot-ping-linux-network-namespace-within-the-same-subnet
+            commands.insert(commands.begin(), "iptables --policy FORWARD ACCEPT");
+            // Enable sending requests and getting responses to/from internet
+            // From: https://dev.to/polarbit/how-docker-container-networking-works-mimic-it-using-linux-network-namespaces-9mj
+            std::string broadcast = BRIDGE_IP;
+            broadcast.pop_back();
+            broadcast.push_back('1');
+            std::string command = "iptables -t nat -A POSTROUTING -s " + broadcast + "/24 ! -o " + BRIDGE_NAME + " -j MASQUERADE";
+            commands.insert(commands.begin(), command);
+            // Assigns an IP address to the bridge
+            commands.insert(commands.begin(), "ip addr add " + BRIDGE_IP + "/24 brd + dev " + BRIDGE_NAME);
+            // Ups the bridge interface
+            commands.insert(commands.begin(), "ip link set " + BRIDGE_NAME + " up");
+            // Creates a network bridge
+            commands.insert(commands.begin(), "ip link add name " + BRIDGE_NAME + " type bridge");
+        }
+
+        for (const auto& command : commands)
+        {
+            if (system(command.c_str()) == -1)
+                throw std::runtime_error("Execute command " + command + ": FAILED");
+        }
+
+        sem_post(networkInitSemaphore);
+//        sem_post(sem_open(NETWORK_NS_SEM_NAME, 0));
+        LOG_F(INFO, "Initialize container network environment: SUCCESS");
     }
-//    container->networkInitSemaphore->release();
-    sem_post(container->networkInitSemaphore);
-    std::cout << "Initialize container network environment: SUCCESS" << std::endl;
+    catch (std::exception& ex)
+    {
+        LOG_F(ERROR, "Initialize container network environment: FAILED");
+        LOG_F(ERROR, "%s", ex.what());
+    }
 }
 
 
@@ -313,19 +337,20 @@ void initializeContainerNetwork(Container* container)
  */
 bool setUpContainer(Container* container)
 {
-    std::cout << "Set up container " << container->id << std::endl;
+    LOG_F(INFO, "Set up container %s", container->id.c_str());
     try
     {
         setUpContainerImage(container);
         setUpContainerDirectory(container);
-        std::cout << "Set up container " << container->id << ": SUCCESS" << std::endl;
+        LOG_F(INFO, "Set up container %s: SUCCESS", container->id.c_str());
     }
     catch (std::exception& ex)
     {
-        std::cout << "[ERROR] Set up container " << container->id << ": FAILED" << std::endl;
+        LOG_F(ERROR, "Set up container %s: FAILED", container->id.c_str());
         std::cout << ex.what() << std::endl;
         return false;
     }
+    // Spawns a worker thread to initialize the network environment for the container
     std::thread networkWorker(initializeContainerNetwork, container);
     networkWorker.detach();
     return true;
@@ -343,7 +368,7 @@ char* createStack(const uint32_t stackSize = 65536)
 {
     auto* stack = new (std::nothrow) char[stackSize];
     if (stack == nullptr)
-        throw std::runtime_error("[ERROR] Allocate memory: FAILED");
+        throw std::runtime_error("Allocate memory: FAILED");
     return stack + stackSize;
 }
 
@@ -358,18 +383,19 @@ char* createStack(const uint32_t stackSize = 65536)
  */
 void setUpProcessLimit(Container* container)
 {
-
+    LOG_F(INFO, "Setting up pid limits");
     std::string pidDir = CGROUP_FOLDER + "/pids/" + container->id;
     if (!std::filesystem::create_directories(pidDir))
-        throw std::runtime_error("[ERROR] Create directory " + pidDir + ": FAILED");
+        throw std::runtime_error("Create directory " + pidDir + ": FAILED");
 
 
     if (!appendToFile(pidDir + "/pids.max", "20"))
-        throw std::runtime_error("[ERROR] Write to file 'pids.max': FAILED");
+        throw std::runtime_error("Write to file 'pids.max': FAILED");
     if (!appendToFile(pidDir + "/notify_on_release", "1"))
-        throw std::runtime_error("[ERROR] Write to file 'notify_on_release': FAILED");
+        throw std::runtime_error("Write to file 'notify_on_release': FAILED");
     if (!appendToFile(pidDir + "/cgroup.procs", std::to_string(container->pid)))
-        throw std::runtime_error("[ERROR] Write to 'cgroup.procs': FAILED");
+        throw std::runtime_error("Write to 'cgroup.procs': FAILED");
+    LOG_F(INFO, "Set up pid limits: SUCCESS");
 }
 
 /**
@@ -391,19 +417,22 @@ void setUpProcessLimit(Container* container)
  */
 void setUpMemoryLimit(Container* container)
 {
+    LOG_F(INFO, "Setting up memory limits");
     std::string memoryDir = CGROUP_FOLDER + "/memory/" + container->id;
     if (!std::filesystem::create_directories(memoryDir))
-        throw std::runtime_error("[ERROR] Create directory " + memoryDir + ": FAILED");
+        throw std::runtime_error("Create directory " + memoryDir + ": FAILED");
 
     // Adds the container's process to the 'tasks' file
     if (!appendToFile(memoryDir + "/tasks", std::to_string(container->pid)))
-        throw std::runtime_error("[ERROR] Write to file 'tasks': FAILED");
+        throw std::runtime_error("Write to file 'tasks': FAILED");
 
     if (!appendToFile(memoryDir + "/memory.limit_in_bytes", "256m"))
-        throw std::runtime_error("[ERROR] Write to file 'memory.limit_in_bytes': FAILED");
+        throw std::runtime_error("Write to file 'memory.limit_in_bytes': FAILED");
 
     if (!appendToFile(memoryDir + "/memory.memsw.limit_in_bytes", "256m"))
-        throw std::runtime_error("[ERROR] Write to file 'memory.memsw.limit_in_bytes': FAILED");
+        throw std::runtime_error("Write to file 'memory.memsw.limit_in_bytes': FAILED");
+
+    LOG_F(INFO, "Set up memory limits: SUCCESS");
 }
 
 /**
@@ -421,16 +450,19 @@ void setUpMemoryLimit(Container* container)
  */
 void setUpCpuLimit(Container* container)
 {
+    LOG_F(INFO, "Setting up CPU limits");
     std::string cpuDir = CGROUP_FOLDER + "/cpu/" + container->id;
     if (!std::filesystem::create_directories(cpuDir))
-        throw std::runtime_error("[ERROR] Create directory " + cpuDir + ": FAILED");
+        throw std::runtime_error("Create directory " + cpuDir + ": FAILED");
 
     // Adds the container's process to the 'tasks' file
     if (!appendToFile(cpuDir + "/tasks", std::to_string(container->pid)))
-        throw std::runtime_error("[ERROR] Write to file 'tasks': FAILED");
+        throw std::runtime_error("Write to file 'tasks': FAILED");
 
     if (!appendToFile(cpuDir + "/cpu.shares", std::to_string(512)))
-        throw std::runtime_error("[ERROR] Write to file 'cpu.shares': FAILED");
+        throw std::runtime_error("Write to file 'cpu.shares': FAILED");
+
+    LOG_F(INFO, "Set up CPU limits: SUCCESS");
 }
 
 
@@ -441,17 +473,20 @@ void setUpCpuLimit(Container* container)
 void setUpResourceLimits(Container* container)
 {
 
-    std::cout << "Setting up container resource limits" << std::endl;
+    LOG_F(INFO, "Setting up container resource limits");
     setUpProcessLimit(container);
     setUpCpuLimit(container);
     setUpMemoryLimit(container);
-    std::cout << "Set up container resource limits: SUCCESS" << std::endl;
+    LOG_F(INFO, "Set up container resource limits: SUCCESS");
 }
 
 
 /**
  * Registers the network namespace of the container by bind-mounting /proc/<pid>/ns/net
  * to /var/run/netns/<container_id>.
+ * Note that two semaphores are used in this place to guarantee that a new network
+ * namespace has been added with 'ip netns add' before mounting /proc/self/ns/net
+ * to the new namespace.
  *
  * References:
  * - https://gist.github.com/cfra/39f4110366fa1ae9b1bddd1b47f586a3
@@ -459,23 +494,21 @@ void setUpResourceLimits(Container* container)
  */
 void setUpNetworkNamespace(Container* container)
 {
-    std::cout << "Setting up network namespace" << std::endl;
+    LOG_F(INFO, "Setting up network namespace");
 
-    // std::string procNetPath = "/proc/" + std::to_string(container->pid) + "/ns/net";
     std::string procNetPath = "/proc/self/ns/net";
     std::string networkNamespacePath = "/var/run/netns/" + container->id;
-//    container->networkNsSemaphore->acquire();
-//    sem_wait(sem_open(NETWORK_NS_SEM_NAME, 0));
     sem_wait(container->networkNsSemaphore);
-    std::cout << "[DEBUG] Before network ns mount" << std::endl;
+//    sem_wait(sem_open(NETWORK_NS_SEM_NAME, 0));
     if (mount(procNetPath.c_str(), networkNamespacePath.c_str(), nullptr, MS_BIND, nullptr) != 0)
-        throw std::runtime_error("[ERROR] Register network namespace with mount: FAILED [Errno " + std::to_string(errno) + "]");
-    std::cout << "[DEBUG] After network ns mount" << std::endl;
+    {
+        sem_post(container->networkInitSemaphore);
+        throw std::runtime_error("Register network namespace with mount: FAILED [Errno " + std::to_string(errno) + "]");
+    }
 
-//    container->networkInitSemaphore->release();
-//    sem_post(sem_open(NETWORK_INIT_SEM_NAME, 0));
     sem_post(container->networkInitSemaphore);
-    std::cout << "Set up network namespace: SUCCESS" << std::endl;
+//    sem_post(sem_open(NETWORK_INIT_SEM_NAME, 0));
+    LOG_F(INFO, "Set up network namespace: SUCCESS");
 }
 
 /**
@@ -487,14 +520,14 @@ void setUpNetworkNamespace(Container* container)
  */
 void mountOverlayFileSystem(Container* container)
 {
-    std::cout << "Mounting overlay fs " << container->rootfs << std::endl;
+    LOG_F(INFO, "Mounting overlay fs %s", container->rootfs.c_str());
     std::string imageRootDir = container->rootDir + "/cache/" + container->distroName + "/rootfs";
     std::string upperDir = container->dir + "/copy-on-write";
     std::string workDir = container->dir + "/work";
     std::string mountData = "lowerdir=" + imageRootDir + ",upperdir=" + upperDir + ",workdir=" + workDir;
     if (mount("overlay", container->rootfs.c_str(), "overlay", MS_NODEV, mountData.c_str()) != 0)
-        throw std::runtime_error("[ERROR] Mount overlay fs: FAILED");
-    std::cout << "Mounting overlay fs " << container->rootfs << ": SUCCESS" << std::endl;
+        throw std::runtime_error("Mount overlay fs: FAILED");
+    LOG_F(INFO, "Mounting overlay fs %s: SUCCESS", container->rootfs.c_str());
 }
 
 /**
@@ -504,25 +537,25 @@ void mountOverlayFileSystem(Container* container)
  */
 void pivotRoot(Container* container)
 {
-    std::cout << "Performing pivot root" << std::endl;
+    LOG_F(INFO, "Performing pivot root");
 
     std::string tempDir = container->rootfs + "/temp";
     if(!std::filesystem::create_directories(tempDir))
-        throw std::runtime_error("[ERROR] Create temp directory " + tempDir + ": FAILED");
+        throw std::runtime_error("Create temp directory " + tempDir + ": FAILED");
 
     if (pivot_root(container->rootfs.c_str(), tempDir.c_str()) != 0)
-        throw std::runtime_error("[ERROR] Pivot root: FAILED");
+        throw std::runtime_error("Pivot root: FAILED");
 
     chdir("/");
 
     // Unmounts the temp directory
     if (umount2("/temp", MNT_DETACH))
-        throw std::runtime_error("[ERROR] Unmount temp directory: FAILED [Errno " + std::to_string(errno) + "]");
+        throw std::runtime_error("Unmount temp directory: FAILED [Errno " + std::to_string(errno) + "]");
 
     if (rmdir("/temp") != 0)
-        throw std::runtime_error("[ERROR] Remove temp directory: FAILED [Errno " + std::to_string(errno) + "]");
+        throw std::runtime_error("Remove temp directory: FAILED [Errno " + std::to_string(errno) + "]");
 
-    std::cout << "Perform pivot root: SUCCESS" << std::endl;
+    LOG_F(INFO, "Perform pivot root: SUCCESS");
 }
 
 /**
@@ -532,18 +565,18 @@ void pivotRoot(Container* container)
 void mountDirectories(Container* container)
 {
     std::string containerDir = container->dir;
-    std::cout << "Mounting directories: proc, sys, dev" << std::endl;
+    LOG_F(INFO, "Mounting directories: proc, sys, dev");
 
     if (mount("proc", "/proc", "proc", 0, nullptr) != 0)
-        throw std::runtime_error("[ERROR] Mount /proc: FAILED [Errno " + std::to_string(errno) + "]");
+        throw std::runtime_error("Mount /proc: FAILED [Errno " + std::to_string(errno) + "]");
 
     if (mount("sysfs", "/sys", "sysfs", 0, nullptr) != 0)
-        throw std::runtime_error("[ERROR] Mount /sys: FAILED [Errno " + std::to_string(errno) + "]");
+        throw std::runtime_error("Mount /sys: FAILED [Errno " + std::to_string(errno) + "]");
 
     if (mount("tmpfs", "/dev", "tmpfs", MS_NOSUID | MS_STRICTATIME, nullptr) != 0)
-        throw std::runtime_error("[ERROR] Mount /dev: FAILED [Errno " + std::to_string(errno) + "]");
+        throw std::runtime_error("Mount /dev: FAILED [Errno " + std::to_string(errno) + "]");
 
-    std::cout << "Mounting directories: SUCCESS" << std::endl;
+    LOG_F(INFO, "Mounting directories: SUCCESS");
 }
 
 /**
@@ -554,29 +587,29 @@ void mountDirectories(Container* container)
  */
 void setUpDev(Container* container)
 {
-    std::cout << "Creating basic devices" << std::endl;
+    LOG_F(INFO, "Creating basic devices");
     std::string devDir = "/dev/";
     // Creates and mounts /dev/pts
     std::string devPtsDir = devDir + "pts";
     if (!std::filesystem::exists(devPtsDir))
     {
         if (!std::filesystem::create_directories(devPtsDir))
-            throw std::runtime_error("[ERROR] Create " + devPtsDir + ": FAILED");
+            throw std::runtime_error("Create " + devPtsDir + ": FAILED");
 
         if (mount("devpts", devPtsDir.c_str(), "devpts", MS_NOEXEC | MS_NOSUID, "newinstance,ptmxmode=0666,mode=620,gid=5") < 0)
-            throw std::runtime_error("[ERROR] Mount " + devPtsDir + ": FAILED [" + std::to_string(errno) + "]");
+            throw std::runtime_error("Mount " + devPtsDir + ": FAILED [" + std::to_string(errno) + "]");
     }
 
     // Creates symlinks for stdin, stdout and stderr
     std::vector<std::string> streams = { "stdin", "stdout", "stderr" };
     if (symlink("/proc/self/fd", (devDir + "fd").c_str()) != 0)
-        throw std::runtime_error("[ERROR] Create symlink for fd: FAILED [" + std::to_string(errno) + "]");
+        throw std::runtime_error("Create symlink for fd: FAILED [" + std::to_string(errno) + "]");
 
     for (std::size_t i = 0; i < streams.size(); i++)
     {
         std::string stream = streams.at(i);
         if (symlink(("/proc/self/fd/" + std::to_string(i)).c_str(), (devDir + stream).c_str()) != 0)
-            throw std::runtime_error("[ERROR] Create symlink for " + stream + ": FAILED [" + std::to_string(errno) + "]");
+            throw std::runtime_error("Create symlink for " + stream + ": FAILED [" + std::to_string(errno) + "]");
     }
 
     std::vector<Device> devs = {
@@ -592,9 +625,9 @@ void setUpDev(Container* container)
     for (const auto& dev : devs)
     {
         if (mknod((devDir + dev.name).c_str(), 0666 | dev.type, makedev(dev.major, dev.minor)) != 0)
-            throw std::runtime_error("[ERROR] Create device " + dev.name + ": FAILED [" + std::to_string(errno) + "]");
+            throw std::runtime_error("Create device " + dev.name + ": FAILED [" + std::to_string(errno) + "]");
     }
-    std::cout << "Create basic devices: SUCCESS" << std::endl;
+    LOG_F(INFO, "Create basic devices: SUCCESS");
 }
 
 
@@ -604,12 +637,15 @@ void setUpDev(Container* container)
  */
 void setUpVariables(Container* container)
 {
+    LOG_F(INFO, "Setting up environment variables");
     clearenv();
 
     setenv("HOME", "/", 0);
     setenv("DISPLAY", ":0.0", 0);
     setenv("TERM", "xterm-256color", 0);
     setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin:/src:/usr/local/bin:/usr/local/sbin", 0);
+
+    LOG_F(INFO, "Set up environment variables: SUCCESS");
 }
 
 
@@ -632,19 +668,25 @@ void setUpVariables(Container* container)
  */
 bool enterContainment(Container* container)
 {
-    std::cout << "Initializing container " << container->id << std::endl;
+    LOG_F(INFO, "Initializing container %s", container->id.c_str());
     try
     {
+        container->networkNsSemaphore = sem_open(NETWORK_NS_SEM_NAME, 0);
+        if (container->networkNsSemaphore == SEM_FAILED)
+            throw std::runtime_error("sem_open failed for " + std::string(NETWORK_NS_SEM_NAME));
+        container->networkInitSemaphore = sem_open(NETWORK_INIT_SEM_NAME, 0);
+        if (container->networkInitSemaphore == SEM_FAILED)
+            throw std::runtime_error("sem_open failed for " + std::string(NETWORK_INIT_SEM_NAME));
 
-        setUpResourceLimits(container);
         setUpNetworkNamespace(container);
+        setUpResourceLimits(container);
         // From:
         // https://github.com/swetland/mkbox/blob/master/mkbox.c
         // https://github.com/dmitrievanthony/sprat/blob/master/src/container.c
         // ensure that changes to our mount namespace do not "leak" to
         // outside namespaces (what mount --make-rprivate / does)
         if (mount("/", "/", nullptr, MS_PRIVATE | MS_REC, nullptr) != 0)
-            throw std::runtime_error("[ERROR] Set MS_PRIVATE to fs: FAILED " + std::to_string(errno) + "]");
+            throw std::runtime_error("Set MS_PRIVATE to fs: FAILED " + std::to_string(errno) + "]");
 
         mountOverlayFileSystem(container);
         pivotRoot(container);
@@ -656,21 +698,19 @@ bool enterContainment(Container* container)
         // Sets the new hostname to be the ID of the container
         sethostname(container->id.c_str(), container->id.length());
         // Blocks the current thread until network environment initialization is finished
-//        container->networkInitSemaphore->acquire();
-//        sem_t* semaphore = sem_open(NETWORK_INIT_SEM_NAME, 0);
-//        if (semaphore == SEM_FAILED)
-//        {
-//            std::cout << "[DEBUG] ERRNO: " << errno << std::endl;
-//        }
         sem_wait(container->networkInitSemaphore);
+//        sem_wait(sem_open(NETWORK_INIT_SEM_NAME, 0));
+        sem_close(container->networkNsSemaphore);
+        sem_close(container->networkInitSemaphore);
     }
     catch (std::exception& ex)
     {
-        std::cout << "[ERROR] Initialize container: FAILED" << std::endl;
-        std::cout << ex.what() << std::endl;
+        LOG_F(ERROR, "Initialize container: FAILED");
+        LOG_F(ERROR, "%s", ex.what());
         return false;
     }
-    std::cout << "Initialize container: SUCCESS" << std::endl;
+    LOG_F(INFO, "Initialize container: SUCCESS");
+    std::cout << "Container " << container->id << " initialized" << std::endl;
     return true;
 }
 
@@ -680,15 +720,15 @@ bool enterContainment(Container* container)
  */
 void unmountDirectories()
 {
-    std::cout << "Unmounting directories: proc, sys, dev" << std::endl;
+    LOG_F(INFO, "Unmounting directories: proc, sys, dev");
     std::vector<std::string> dirs = { "/proc", "/sys", "/dev/pts", "/dev" };
     for (const auto& dir : dirs)
     {
         if (umount(dir.c_str()) != 0)
-            throw std::runtime_error("[ERROR] Unmount " + dir + ": FAILED [Errno " + std::to_string(errno) + "]");
+            throw std::runtime_error("Unmount " + dir + ": FAILED [Errno " + std::to_string(errno) + "]");
     }
 
-    std::cout << "Unmounting directories: SUCCESS" << std::endl;
+    LOG_F(INFO, "Unmounting directories: SUCCESS");
 }
 
 
@@ -720,7 +760,7 @@ int execute(void* arg)
     std::cout << "Executing command: " << command << std::endl;
     if (system(command.c_str()) == -1)
     {
-        std::cout << "[ERROR] Execute command " << command << ": FAILED [Errno " << errno << "]" << std::endl;
+        LOG_F(ERROR, "Execute command %s: FAILED [Errno %d]", command.c_str(), errno);
         return -1;
     }
     exitContainment(container);
@@ -728,35 +768,42 @@ int execute(void* arg)
 }
 
 /**
+ * Starts a containerized process by invoking the clone() function.
+ * The new namespaces created are: pid, uts, network, mount. Waits
+ * for the cloned process to finish.
  *
  * Implementations from:
  * - https://cesarvr.github.io/post/2018-05-22-create-containers/
- * - https://github1s.com/7aske/ccont/blob/master/source/jail.c
+ * - https://github.com/7aske/ccont/blob/master/source/jail.c
  */
 void startContainer(Container* container)
 {
-    std::cout << "Starting container with pid " << getpid() << std::endl;
+    std::string info = "Starting container " + container->id + " with pid " + std::to_string(getpid());
+    LOG_F(INFO, "%s", info.c_str());
+    std::cout << info << std::endl;
+
     int flags =  SIGCHLD | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWNET;
     char* childStack = createStack();
     int pid = clone(execute, childStack, flags, (void*) container);
     if (pid < 0)
     {
-        std::cout << "[ERROR] Start container " << container->id
-                  << ": FAILED [Unable to create child process " << pid << "]" << std::endl;
+        LOG_F(ERROR, "Start container %s: FAILED [Unable to create child process %d]", container->id.c_str(), pid);
         return;
     }
     int exitStatus;
     // Waits for the Container to finish executing the given command.
     if (waitpid(pid, &exitStatus, 0) == -1)
-        std::cout << "[ERROR] waitpid() failed for child process " << pid << std::endl;
+        LOG_F(INFO, "waitpid() failed for child process %d", pid);
     if (WIFEXITED(exitStatus))
     {
-        std::cout << "Container " << container->id << " exit status: " << WEXITSTATUS(exitStatus) << std::endl;
+        info = "Container " + container->id + " exit status " + std::to_string(WEXITSTATUS(exitStatus));
+        LOG_F(INFO, "%s", info.c_str());
+        std::cout << info << std::endl;
     }
     else
     {
         // If seg fault happens during the execution
-        std::cout << "[ERROR] Container " << container->id << " exited with status: " << exitStatus << std::endl;
+        LOG_F(ERROR, "Container %s exited with status: %d", container->id.c_str(), exitStatus);
     }
 }
 
@@ -768,7 +815,7 @@ void startContainer(Container* container)
  */
 void removeCGroupDirs(Container* container)
 {
-    std::cout << "Removing CGroup folders of container " << container->id << std::endl;
+    LOG_F(INFO, "Removing CGroup folders of container %s", container->id.c_str());
     std::vector<std::string> resources = {
             "pids", "memory", "cpu"
     };
@@ -778,11 +825,10 @@ void removeCGroupDirs(Container* container)
         // FIXME Only rmdir can remove the directory in cgroup, yet it always has an errno of 21
         if (rmdir(dir.c_str()) < 0 && errno != 21)
         {
-            throw std::runtime_error(
-                    "[ERROR] Remove directory " + dir + ": FAILED [Errno " + std::to_string(errno) + "]");
+            throw std::runtime_error("Remove directory " + dir + ": FAILED [Errno " + std::to_string(errno) + "]");
         }
     }
-    std::cout << "Remove CGroup folders: SUCCESS"<< std::endl;
+    LOG_F(INFO, "Remove CGroup folders: SUCCESS");
 }
 
 
@@ -792,13 +838,13 @@ void removeCGroupDirs(Container* container)
 void removeContainerDirectory(Container* container)
 {
     std::string containerDir = container->dir;
-    std::cout << "Removing " << containerDir << std::endl;
+    LOG_F(INFO, "Removing %s", containerDir.c_str());
     std::error_code errorCode;
     if (!std::filesystem::remove_all(containerDir, errorCode))
     {
-        throw std::runtime_error("[ERROR] Remove directory " + containerDir + ": FAILED " + errorCode.message());
+        throw std::runtime_error("Remove directory " + containerDir + ": FAILED " + errorCode.message());
     }
-    std::cout << "Removing " << containerDir << ": SUCCESS" << std::endl;
+    LOG_F(INFO, "Removing %s: SUCCESS", containerDir.c_str());
 }
 
 
@@ -810,11 +856,11 @@ void removeContainerDirectory(Container* container)
  */
 void cleanUpContainerNetwork(Container* container)
 {
-    std::cout << "Cleaning up container network environment" << std::endl;
+    LOG_F(INFO, "Cleaning up container network environment");
 
     std::string networkNamespacePath = "/var/run/netns/" + container->id;
     if (umount(networkNamespacePath.c_str()) != 0)
-        throw std::runtime_error("[ERROR] Unmount " + networkNamespacePath + ": FAILED [Errno " + std::to_string(errno) + "]");
+        throw std::runtime_error("Unmount " + networkNamespacePath + ": FAILED [Errno " + std::to_string(errno) + "]");
 
     std::vector<std::string> commands = {
             "ip link delete " + container->vEthPair.second,
@@ -823,10 +869,10 @@ void cleanUpContainerNetwork(Container* container)
     for (const auto& command : commands)
     {
         if (system(command.c_str()) == -1)
-            throw std::runtime_error("[ERROR] Execute command " + command + ": FAILED");
+            throw std::runtime_error("Execute command " + command + ": FAILED");
     }
 
-    std::cout << "Clean up container network environment: SUCCESS" << std::endl;
+    LOG_F(INFO, "Clean up container network environment: SUCCESS");
 }
 
 
@@ -842,25 +888,25 @@ void cleanUpContainerNetwork(Container* container)
 bool cleanUpContainer(Container* container)
 {
     std::string containerId = container->id;
-    std::cout << "Clean up container " << containerId << std::endl;
+    LOG_F(INFO, "Clean up container %s", containerId.c_str());
     try
     {
         removeContainerDirectory(container);
         removeCGroupDirs(container);
         cleanUpContainerNetwork(container);
 
-//        delete container->networkInitSemaphore;
-//        delete container->networkNsSemaphore;
-        sem_destroy(container->networkNsSemaphore);
-        sem_destroy(container->networkInitSemaphore);
+        sem_close(container->networkNsSemaphore);
+        sem_unlink(NETWORK_INIT_SEM_NAME);
+        sem_close(container->networkInitSemaphore);
+        sem_unlink(NETWORK_NS_SEM_NAME);
         delete container;
-        std::cout << "Clean up container " << containerId << ": SUCCESS" << std::endl;
+        LOG_F(INFO, "Clean up container %s: SUCCESS", containerId.c_str());
         return true;
     }
     catch (std::exception& ex)
     {
-        std::cout << "[ERROR] Clean up container " << containerId << ": FAILED" << std::endl;
-        std::cout << ex.what() << std::endl;
+        LOG_F(ERROR, "Clean up container %s: FAILED", containerId.c_str());
+        LOG_F(ERROR, "%s", ex.what());
         return false;
     }
 }
