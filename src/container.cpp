@@ -865,7 +865,7 @@ void buildContainerImage(Container* container)
 
     std::string imageFilePath = imageDir + "/" + container->id + ".tar.gz";
     char buffer[256];
-    sprintf(buffer, "tar -czf %s -C %s .", imageFilePath.c_str(), container->rootfs.c_str());
+    sprintf(buffer, "tar -czf %s -C %s", imageFilePath.c_str(), container->rootfs.c_str());
     if (system(buffer) == -1)
         throw std::runtime_error("Build image for container: FAILED");
 

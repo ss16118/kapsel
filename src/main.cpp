@@ -2,6 +2,8 @@
 #include <vector>
 #include <string>
 #include <filesystem>
+#include <time.h>
+#include <sys/stat.h>
 #include <loguru/loguru.hpp>
 #include <cxxopts/cxxopts.hpp>
 
@@ -10,7 +12,11 @@
 #include "utils.h"
 
 std::map<std::string, CommandType> stringToCommandType = {
-        { "run", Run }
+        { "run", Run },
+        { "ls", List },
+        { "list", List },
+        { "rm", Delete },
+        { "delete", Delete }
 };
 
 /**
@@ -32,6 +38,28 @@ void run(std::string rootDir,
     }
     cleanUpContainer(container);
 }
+
+/**
+ * Displays the all the container images which have been built
+ * and other relevant information.
+ */
+void list(const std::string& rootDir)
+{
+    printf("%20s  %10s  %30s\n", "Image ID", "Size", "Last Modified");
+    for (const auto& archive : std::filesystem::recursive_directory_iterator(rootDir + "/images"))
+    {
+        std::string imageId = split(archive.path().filename(), ".")[0];
+
+        // Obtains the time at which the file was last modified
+        struct stat attr{};
+        stat(archive.path().c_str(), &attr);
+        std::string lastModified(trimEnd(ctime(&attr.st_mtime)));
+
+        std::string fileSize = getHumanReadableFileSize(std::filesystem::file_size(archive));
+        printf("%20s  %10s  %30s\n", imageId.c_str(), fileSize.c_str(), lastModified.c_str());
+    }
+}
+
 
 
 int main(int argc, char* argv[])
@@ -62,7 +90,7 @@ int main(int argc, char* argv[])
             // Logging
             ("l,logging", "Enable logging to a log file.")
 
-            ("cmd-type", R"(Type of actions to perform. Available options are {"run"}.)",
+            ("cmd-type", R"(Type of actions to perform. Available options are {"run", "list", "delete"}.)",
              cxxopts::value<std::string>())
 
             ("cmd", "The command to be executed in a containerized environment.",
@@ -124,6 +152,10 @@ int main(int argc, char* argv[])
         {
             case Run:
                 run(rootDir, containerId, distroName, command.str(), resourceLimits, parsedOptions["build"].as<bool>());
+                break;
+
+            case List:
+                list(rootDir);
                 break;
 
             default:

@@ -7,9 +7,12 @@
 #include <unistd.h>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <arpa/inet.h>
 #include <array>
+#include <regex>
 #include <utility>
+#include <iomanip>
 
 /**
  * Checks if a string ends with the given suffix. Returns true if it does, false otherwise.
@@ -134,4 +137,51 @@ std::string systemWithOutput(const std::string& command)
         return std::string(result);
     else
         throw std::runtime_error("[ERROR] Execution of command " + command + " exited with " + std::to_string(status));
+}
+
+/**
+ * Splits the given text into a vector of strings with the given delimiter.
+ * Implementation from:
+ * https://stackoverflow.com/questions/14265581/parse-split-a-string-in-c-using-string-delimiter-standard-c
+ */
+std::vector<std::string> split(std::string text, std::string delimiter)
+{
+    std::vector<std::string> list;
+    size_t pos = 0;
+    std::string token;
+    while ((pos = text.find(delimiter)) != std::string::npos) {
+        token = text.substr(0, pos);
+        list.push_back(token);
+        text.erase(0, pos + delimiter.length());
+    }
+    list.push_back(text);
+    return list;
+}
+
+
+std::string getHumanReadableFileSize(std::uintmax_t size)
+{
+    int i{};
+    std::stringstream fileSize;
+
+    double mantissa = size;
+    for (; mantissa >= 1024.; mantissa /= 1024., ++i) { }
+    mantissa = std::ceil(mantissa * 10.) / 10.;
+    fileSize << std::fixed << std::setprecision(1) << mantissa << "BKMGTPE"[i];
+    if (i != 0)
+        fileSize << "B";
+    return fileSize.str();
+}
+
+
+/**
+ * Trims all the white space characters from the end of a string.
+ */
+std::string trimEnd(std::string text)
+{
+
+    text.erase(std::find_if(text.rbegin(), text.rend(),
+                            std::not1(std::ptr_fun<int, int>(std::isspace))).base(), text.end());
+    return text;
+
 }

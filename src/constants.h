@@ -11,7 +11,7 @@
 #define NETWORK_INIT_SEM_NAME "/networkInitSemaphore"
 
 enum CommandType {
-    Run
+    Run, List, Delete
 };
 
 extern std::map<std::string, CommandType> stringToCommandType;
