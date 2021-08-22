@@ -63,13 +63,16 @@ Container* createContainer(
         std::string& containerId,
         std::string& rootDir,
         std::string& command,
-        ResourceLimits* resourceLimits)
+        ResourceLimits* resourceLimits,
+        bool buildImage)
 {
+
     auto* container = new Container;
     container->distroName = distroName;
     container->id = containerId;
     container->rootDir = rootDir;
     container->command = command;
+    container->buildImage = buildImage;
 
     // Retrieves the name of the current user
     char buffer[128];
@@ -92,8 +95,9 @@ Container* createContainer(
  * 1. Checks if the cache directory exists in the root directory. Creates it if it does not.
  * 2. Checks if the rootfs archive for the specified distro exists. Fetches it from the pre-defined
  * download URL if it is not present in the cache directory.
- * 3. If the 'rootfs' directory does not exist for the specified distro, creates said directory
- * and unpacks the file system of the distro in it.
+ * 3. If 'buildImage' is false and the 'rootfs' directory does not exist for the specified distro,
+ * creates said directory and unpacks the file system of the distro in it. If 'buildImage' is true,
+ * unpacks the file system into the container's directory in <root-dir>/containers/<container-id>/.
  * Implementation based on https://github.com/Fewbytes/rubber-docker/blob/master/levels/10_setuid/rd.py
  */
 void setUpContainerImage(Container* container)
@@ -109,7 +113,7 @@ void setUpContainerImage(Container* container)
         if (std::filesystem::create_directories(cacheDir))
             std::cout << "Create cache directory " + cacheDir << ": SUCCESS" << std::endl;
         else
-            throw std::runtime_error("Failed to create cache directory " + cacheDir);
+            throw std::runtime_error("Create cache directory " + cacheDir + ": FAILED");
     }
 
 
@@ -130,20 +134,33 @@ void setUpContainerImage(Container* container)
             throw std::runtime_error("Download rootfs archive for " + distroName + ": FAILED");
     }
 
-    // Creates the rootfs folder for the given distro and extracts the archive
-    std::string imageRootDir = cacheDir + "/rootfs";
-    if (!std::filesystem::exists(imageRootDir))
+    // Extracts the archive to the location depending on the value of 'buildImage'
+    // If 'buildImage' is true, extracts the file system to the container's directory.
+    // Otherwise, extracts the files to distro's directory.
+    std::string rootfsDestDir;
+    if (container->buildImage)
     {
-        if (std::filesystem::create_directories(imageRootDir))
-            LOG_F(INFO, "Create directory %s: SUCCESS", imageRootDir.c_str());
-        else
-            throw std::runtime_error("Create directory " + imageRootDir + ": FAILED");
+        container->dir = container->rootDir + "/containers/" + container->id;
+        container->rootfs = container->dir + "/rootfs";
+        rootfsDestDir = container->rootfs;
+    }
+    else
+    {
+        rootfsDestDir = cacheDir + "/rootfs";
+    }
 
-        // Extracts the files
-        LOG_F(INFO, "Extracting rootfs from %s to %s", rootfsArchive.c_str(), imageRootDir.c_str());
-        sprintf(buffer, "tar xvf %s -C %s > /dev/null", rootfsArchive.c_str(), imageRootDir.c_str());
+    // Creates the destination folder, and extracts the files
+    if (!std::filesystem::exists(rootfsDestDir))
+    {
+        if (std::filesystem::create_directories(rootfsDestDir))
+            LOG_F(INFO, "Create directory %s: SUCCESS", rootfsDestDir.c_str());
+        else
+            throw std::runtime_error("Create directory " + rootfsDestDir + ": FAILED");
+
+        LOG_F(INFO, "Extracting rootfs from %s to %s", rootfsArchive.c_str(), rootfsDestDir.c_str());
+        sprintf(buffer, "tar xvf %s -C %s > /dev/null", rootfsArchive.c_str(), rootfsDestDir.c_str());
         if (system(buffer) == -1)
-            throw std::runtime_error("Extract " + rootfsArchive + " to " + imageRootDir + ": FAILED");
+            throw std::runtime_error("Extract " + rootfsArchive + " to " + rootfsDestDir + ": FAILED");
     }
 }
 
@@ -157,12 +174,11 @@ void setUpContainerImage(Container* container)
  *
  * @param container the container whose file system will be created.
  */
-void setUpContainerDirectory(Container* container)
+void setUpContainerOverlayFs(Container* container)
 {
     char buffer[256];
     container->dir = container->rootDir + "/containers/" + container->id;
     std::string containerDir = container->dir;
-    std::string currentUser = container->currentUser;
 
     // Creates the container directory and extracts the specified root file system
     if (!std::filesystem::exists(containerDir))
@@ -184,13 +200,6 @@ void setUpContainerDirectory(Container* container)
                 throw std::runtime_error("Create " + dir + ": FAILED");
         }
         LOG_F(INFO, "Set up overlay fs directories in %s: SUCCESS", containerDir.c_str());
-
-        // Makes the current user the owner of the container directory
-        sprintf(buffer, "chown -R %s %s", currentUser.c_str(), containerDir.c_str());
-        if (system(buffer) == -1)
-            throw std::runtime_error("Make" + currentUser + " the owner of " + containerDir + ": FAILED");
-        else
-            LOG_F(INFO, "Setting the owner of %s to %s", containerDir.c_str(), currentUser.c_str());
     }
 }
 
@@ -205,7 +214,8 @@ std::string getContainerVEthIp()
     {
         // Counts the number of containers that already exist by
         // checking the number of connections to the bridge
-        int connectionCount = std::stoi(systemWithOutput("brctl show " + BRIDGE_NAME + " | grep veth1 | wc -l")) + 1;
+        int connectionCount =
+                std::stoi(systemWithOutput("brctl show " + BRIDGE_NAME + " | grep veth1 | wc -l")) + 1;
         return getNextIp(BRIDGE_IP, connectionCount);
     }
     catch (std::exception& ex)
@@ -330,8 +340,9 @@ void initializeContainerNetwork(Container* container)
 /**
  * Prepares and sets up the environment required for the container to
  * run correctly. Performs the following actions:
- * 1. Downloads and extracts the rootfs to the specified folder.
- * 2. Initializes the overlay fs folders in the container's directory.
+ * 1. Downloads and extracts the rootfs to a specified folder.
+ * 2. Initializes the overlay fs folders in the container's directory
+ * if 'buildImage' is false.
  * 3. Initializes the networking environment for the given container.
  *
  * @param container a struct representing the container whose file system will initialized.
@@ -343,13 +354,24 @@ bool setUpContainer(Container* container)
     try
     {
         setUpContainerImage(container);
-        setUpContainerDirectory(container);
+        if (!container->buildImage)
+            setUpContainerOverlayFs(container);
+
+        // Makes the current user the owner of the container directory
+        char buffer[256];
+        std::string currentUser = container->currentUser;
+        std::string containerDir = container->dir;
+        sprintf(buffer, "chown -R %s %s", currentUser.c_str(), containerDir.c_str());
+        if (system(buffer) == -1)
+            throw std::runtime_error("Make" + currentUser + " the owner of " + containerDir + ": FAILED");
+        else
+            LOG_F(INFO, "Setting the owner of %s to %s", containerDir.c_str(), currentUser.c_str());
         LOG_F(INFO, "Set up container %s: SUCCESS", container->id.c_str());
     }
     catch (std::exception& ex)
     {
         LOG_F(ERROR, "Set up container %s: FAILED", container->id.c_str());
-        std::cout << ex.what() << std::endl;
+        LOG_F(ERROR, "%s", ex.what());
         return false;
     }
     // Spawns a worker thread to initialize the network environment for the container
@@ -534,31 +556,44 @@ void mountOverlayFileSystem(Container* container)
 }
 
 /**
- * Uses pivot_root() to make the container's rootfs directory the new root file system.
+ * Changes the root file system so that the container's fs can be isolated.
+ * If 'buildImage' is false, uses pivot_root() to make the container's rootfs
+ * directory the new root file system.
+ * If 'buildImage' is true, uses chroot.
+ *
  * Implementation based on:
  * https://github.com/Fewbytes/rubber-docker/blob/master/levels/10_setuid/rd.py
+ *
  */
-void pivotRoot(Container* container)
+void changeRoot(Container* container)
 {
-    LOG_F(INFO, "Performing pivot root");
+    LOG_F(INFO, "Isolating file system");
 
-    std::string tempDir = container->rootfs + "/temp";
-    if(!std::filesystem::create_directories(tempDir))
-        throw std::runtime_error("Create temp directory " + tempDir + ": FAILED");
+    if (container->buildImage)
+    {
+        if (chroot(container->rootfs.c_str()) != 0)
+            throw std::runtime_error("[ERROR] chroot " + container->rootfs + ": FAILED");
+        chdir("/");
+    }
+    else
+    {
+        std::string tempDir = container->rootfs + "/temp";
+        if (!std::filesystem::create_directories(tempDir))
+            throw std::runtime_error("Create temp directory " + tempDir + ": FAILED");
 
-    if (pivot_root(container->rootfs.c_str(), tempDir.c_str()) != 0)
-        throw std::runtime_error("Pivot root: FAILED");
+        if (pivot_root(container->rootfs.c_str(), tempDir.c_str()) != 0)
+            throw std::runtime_error("Pivot root: FAILED [Errno " + std::to_string(errno) + "]");
 
-    chdir("/");
+        chdir("/");
 
-    // Unmounts the temp directory
-    if (umount2("/temp", MNT_DETACH))
-        throw std::runtime_error("Unmount temp directory: FAILED [Errno " + std::to_string(errno) + "]");
+        // Unmounts the temp directory
+        if (umount2("/temp", MNT_DETACH))
+            throw std::runtime_error("Unmount temp directory: FAILED [Errno " + std::to_string(errno) + "]");
 
-    if (rmdir("/temp") != 0)
-        throw std::runtime_error("Remove temp directory: FAILED [Errno " + std::to_string(errno) + "]");
-
-    LOG_F(INFO, "Perform pivot root: SUCCESS");
+        if (rmdir("/temp") != 0)
+            throw std::runtime_error("Remove temp directory: FAILED [Errno " + std::to_string(errno) + "]");
+    }
+    LOG_F(INFO, "Isolate file system: SUCCESS");
 }
 
 /**
@@ -659,7 +694,7 @@ void setUpVariables(Container* container)
  * 2. Sets up network namespace.
  * 3. Mounts the root mount as private and recursively so that the sub-mounts will
  * not be visible to the parent mount.
- * 4. Mounts the overlay file system.
+ * 4. Mounts the overlay file system if 'buildImage' is set to false.
  * 5. Changes the root file system uses pivot_root(). This step has the effect as
  * performing chroot, except for the fact that it is more secure.
  * 6. Mounts the a list of required directories to the root file system in the container.
@@ -691,8 +726,10 @@ bool enterContainment(Container* container)
         if (mount("/", "/", nullptr, MS_PRIVATE | MS_REC, nullptr) != 0)
             throw std::runtime_error("Set MS_PRIVATE to fs: FAILED " + std::to_string(errno) + "]");
 
-        mountOverlayFileSystem(container);
-        pivotRoot(container);
+        if (!container->buildImage)
+            mountOverlayFileSystem(container);
+
+        changeRoot(container);
         mountDirectories(container);
         setUpDev(container);
         setUpVariables(container);
@@ -700,7 +737,7 @@ bool enterContainment(Container* container)
         appendToFile("/etc/resolv.conf", "nameserver " + DEFAULT_NAMESERVER);
         // Sets the new hostname to be the ID of the container
         sethostname(container->id.c_str(), container->id.length());
-        // Blocks the current thread until network environment initialization is finished
+        // Blocks the current thread until network environment lization is finished
         sem_wait(container->networkInitSemaphore);
 //        sem_wait(sem_open(NETWORK_INIT_SEM_NAME, 0));
         sem_close(container->networkNsSemaphore);
@@ -810,6 +847,32 @@ void startContainer(Container* container)
     }
 }
 
+/**
+ * Packages the rootfs directory of the container into a tarball and saves
+ * it to <root-dir>/images.
+ */
+void buildContainerImage(Container* container)
+{
+    LOG_F(INFO, "Building image for container %s", container->id.c_str());
+    std::string imageDir = container->rootDir + "/images";
+    if (!std::filesystem::exists(imageDir))
+    {
+        if (!std::filesystem::create_directories(imageDir))
+            throw std::runtime_error("Create directory " + imageDir + ": FAILED");
+        else
+            LOG_F(INFO, "Create directory %s: SUCCESS", imageDir.c_str());
+    }
+
+    std::string imageFilePath = imageDir + "/" + container->id + ".tar.gz";
+    char buffer[256];
+    sprintf(buffer, "tar -czf %s -C %s .", imageFilePath.c_str(), container->rootfs.c_str());
+    if (system(buffer) == -1)
+        throw std::runtime_error("Build image for container: FAILED");
+
+    std::cout << "Container image saved to " << imageFilePath << std::endl;
+    LOG_F(INFO, "Build image for container: SUCCESS");
+}
+
 
 /**
  * Removes the cgroup limitations imposed on the container
@@ -896,10 +959,12 @@ void destroyContainer(Container* container)
 /**
  * Cleans up the system after a container finishes running.
  * Performs the following actions:
- * 1. Deletes the container rootfs directory.
- * 2. Removes the container-associated folders created in the cgroup folder.
- * 3. Cleans up the networking environment of the container.
- * 4. Deallocates all the memory taken up by the given Container struct.
+ * 1. Builds a tarball image for the container and saves it
+ * to <root-dir>/images.
+ * 2. Deletes the container rootfs directory.
+ * 3. Removes the container-associated folders created in the cgroup folder.
+ * 4. Cleans up the networking environment of the container.
+ * 5. Deallocates all the memory taken up by the given Container struct.
  * @return true if clean up succeeds, false otherwise.
  */
 bool cleanUpContainer(Container* container)
@@ -908,6 +973,8 @@ bool cleanUpContainer(Container* container)
     LOG_F(INFO, "Clean up container %s", containerId.c_str());
     try
     {
+        if (container->buildImage)
+            buildContainerImage(container);
         removeContainerDirectory(container);
         removeCGroupDirs(container);
         cleanUpContainerNetwork(container);

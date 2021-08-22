@@ -28,6 +28,7 @@ struct ResourceLimits
 struct Container
 {
     pid_t pid;
+    bool buildImage;
     std::string distroName;
     std::string id;
     std::string rootDir;
@@ -47,7 +48,8 @@ Container* createContainer(std::string& distroName,
                            std::string& containerId,
                            std::string& rootDir,
                            std::string& command,
-                           ResourceLimits* resourceLimits);
+                           ResourceLimits* resourceLimits,
+                           bool buildImage);
 void startContainer(Container* container);
 
 #endif //CONTAINER_CPP_CONTAINER_H

@@ -14,15 +14,18 @@ std::map<std::string, CommandType> stringToCommandType = {
 };
 
 /**
- * Executes the given command in a containerized environment.
+ * Executes the given command in a containerized environment as per the specified parameters.
+ * If 'buildImage' is true, a
  */
 void run(std::string rootDir,
          std::string containerId,
          std::string& distroName,
          std::string command,
-         ResourceLimits* resourceLimits)
+         ResourceLimits* resourceLimits,
+         bool buildImage)
 {
-    Container* container = createContainer(distroName, containerId, rootDir, command, resourceLimits);
+    Container* container =
+            createContainer(distroName, containerId, rootDir, command, resourceLimits, buildImage);
     if (setUpContainer(container))
     {
         startContainer(container);
@@ -41,10 +44,11 @@ int main(int argc, char* argv[])
             ("t,rootfs",
              R"(The root file system for the container. Current options are {"ubuntu", "alpine", "arch", "centos"}.)",
              cxxopts::value<std::string>()->default_value("ubuntu"))
-            ("i,container-id", "The ID that will be given to the container.",
-                    cxxopts::value<std::string>())
+            ("i,container-id", "Specify the ID that will be given to the container.", cxxopts::value<std::string>())
             ("r,root-dir", "The directory where all Kapsel related files will be stored.",
                     cxxopts::value<std::string>()->default_value("../res"))
+            ("b,build", "Build an image of the container after exiting.")
+
             // Resource limits
             ("p,process-number", R"(The maximum number of processes can be created in the container. Use "max" to remove limit.)",
                     cxxopts::value<std::string>()->default_value("20"))
@@ -56,7 +60,7 @@ int main(int argc, char* argv[])
                     cxxopts::value<std::string>()->default_value("512m"))
 
             // Logging
-            ("l,logging", "Enable logging to a log file.", cxxopts::value<bool>()->default_value("true"))
+            ("l,logging", "Enable logging to a log file.")
 
             ("cmd-type", R"(Type of actions to perform. Available options are {"run"}.)",
              cxxopts::value<std::string>())
@@ -119,7 +123,7 @@ int main(int argc, char* argv[])
         switch (commandType)
         {
             case Run:
-                run(rootDir, containerId, distroName, command.str(), resourceLimits);
+                run(rootDir, containerId, distroName, command.str(), resourceLimits, parsedOptions["build"].as<bool>());
                 break;
 
             default:
