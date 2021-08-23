@@ -16,8 +16,34 @@ std::map<std::string, CommandType> stringToCommandType = {
         { "ls", List },
         { "list", List },
         { "rm", Delete },
+        { "remove", Delete },
         { "delete", Delete }
 };
+
+
+/**
+ * Fetches a list of container images from the directory <root-dir>/images/.
+ * Returns the images as a vector of 'Image' structs, which contain the
+ * relevant data.
+ */
+std::vector<Image> getContainerImages(const std::string& rootDir)
+{
+    std::vector<Image> images;
+    for (const auto& archive : std::filesystem::recursive_directory_iterator(rootDir + "/images"))
+    {
+        std::string imageId = split(archive.path().filename(), ".")[0];
+        // Obtains the time at which the file was last modified
+        struct stat attr{};
+        stat(archive.path().c_str(), &attr);
+        std::string lastModified(trimEnd(ctime(&attr.st_mtime)));
+
+        uintmax_t fileSize = std::filesystem::file_size(archive);
+        images.emplace_back(Image { imageId, fileSize, lastModified });
+    }
+    return images;
+}
+
+
 
 /**
  * Executes the given command in a containerized environment as per the specified parameters.
@@ -45,28 +71,46 @@ void run(std::string rootDir,
  */
 void list(const std::string& rootDir)
 {
-    printf("%20s  %10s  %30s\n", "Image ID", "Size", "Last Modified");
-    for (const auto& archive : std::filesystem::recursive_directory_iterator(rootDir + "/images"))
+    printf("%4s  %20s  %10s  %30s\n", "#", "Image ID", "Size", "Last Modified");
+    int count = 0;
+    for (const auto& image : getContainerImages(rootDir))
     {
-        std::string imageId = split(archive.path().filename(), ".")[0];
-
-        // Obtains the time at which the file was last modified
-        struct stat attr{};
-        stat(archive.path().c_str(), &attr);
-        std::string lastModified(trimEnd(ctime(&attr.st_mtime)));
-
-        std::string fileSize = getHumanReadableFileSize(std::filesystem::file_size(archive));
-        printf("%20s  %10s  %30s\n", imageId.c_str(), fileSize.c_str(), lastModified.c_str());
+        std::string fileSize = getHumanReadableFileSize(image.fileSize);
+        printf("%4d  %20s  %10s  %30s\n", count, image.id.c_str(), fileSize.c_str(), image.lastModified.c_str());
+        count++;
     }
 }
 
+/**
+ * Removes the container images (tarballs) specified by the vector of containerIds
+ * from the directory <root-dir>/images/.
+ */
+void remove(const std::string& rootDir, const std::vector<std::string>& imageIds)
+{
+    std::filesystem::path imageDir(rootDir + "/images");
+    for (const auto& imageId : imageIds)
+    {
+        auto imagePath = imageDir / (imageId + ".tar.gz");
+        if (!std::filesystem::exists(imagePath))
+        {
+            std::cout << "Image with ID " << imageId << " does not exist" << std::endl;
+        }
+        else
+        {
+            if (std::filesystem::remove(imagePath))
+                std::cout << "Removed image with ID " << imageId << std::endl;
+            else
+                std::cout << "Failed to remove image with ID " << imageId << ": [Errno " << errno << "]" << std::endl;
+        }
+    }
+}
 
 
 int main(int argc, char* argv[])
 {
     // Sets up argument parsing
     cxxopts::Options options(argv[0], "Linux container implemented in C++");
-    options.positional_help("[cmd-type] [cmd]").show_positional_help();
+    options.positional_help("[cmd-type] [args]").show_positional_help();
     options.set_width(80).set_tab_expansion().add_options()
             // Container parameters
             ("t,rootfs",
@@ -90,15 +134,21 @@ int main(int argc, char* argv[])
             // Logging
             ("l,logging", "Enable logging to a log file.")
 
-            ("cmd-type", R"(Type of actions to perform. Available options are {"run", "list", "delete"}.)",
+            ("cmd-type", "Type of actions to perform. Available options are {'run', 'list', 'delete'}.\n"
+                         "run   : executes the preceding command inside a container.\n"
+                         "list  : lists the container images which have been built.\n"
+                         "delete: remove the container images which have the preceding list of IDs.",
              cxxopts::value<std::string>())
 
-            ("cmd", "The command to be executed in a containerized environment.",
-             cxxopts::value<std::vector<std::string>>()->default_value("/bin/sh"))
+            ("args", "The arguments that will passed to command type <cmd-type>. "
+                     "For instance, when <cmd-type> is 'run', args will function as the command to be executed "
+                     "in the container; when <cmd-type> is 'delete', args will be a list of image IDs of the images"
+                     "to be deleted.",
+                     cxxopts::value<std::vector<std::string>>()->default_value(""))
 
             ("h,help", "Print arguments and their descriptions.")
             ;
-    options.parse_positional({"cmd-type", "cmd"});
+    options.parse_positional({"cmd-type", "args"});
 
     try
     {
@@ -117,10 +167,7 @@ int main(int argc, char* argv[])
         std::string commandTypeString = parsedOptions["cmd-type"].as<std::string>();
         CommandType commandType = stringToCommandType[commandTypeString];
 
-        auto& commandArgs = parsedOptions["cmd"].as<std::vector<std::string>>();
-
-        std::ostringstream command;
-        std::copy(commandArgs.begin(), commandArgs.end(), std::ostream_iterator<std::string>(command, " "));
+        auto& args = parsedOptions["args"].as<std::vector<std::string>>();
 
         std::string distroName = parsedOptions["rootfs"].as<std::string>();
         if (!availableDistros.count(distroName))
@@ -151,11 +198,19 @@ int main(int argc, char* argv[])
         switch (commandType)
         {
             case Run:
-                run(rootDir, containerId, distroName, command.str(), resourceLimits, parsedOptions["build"].as<bool>());
+            {
+                std::ostringstream command;
+                std::copy(args.begin(), args.end(), std::ostream_iterator<std::string>(command, " "));
+                run(rootDir, containerId, distroName, command.str(), resourceLimits,
+                    parsedOptions["build"].as<bool>());
                 break;
-
+            }
             case List:
                 list(rootDir);
+                break;
+
+            case Delete:
+                remove(rootDir, args);
                 break;
 
             default:

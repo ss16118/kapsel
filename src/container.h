@@ -21,6 +21,16 @@ struct ResourceLimits
     std::string swapMemory;
 };
 
+/**
+ * A struct which contains all the relevant
+ * information of a container's image (tarball).
+ */
+struct Image
+{
+    std::string id;
+    uintmax_t fileSize;
+    std::string lastModified;
+};
 
 /**
  * A struct representing an individual container.
