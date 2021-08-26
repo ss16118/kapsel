@@ -64,7 +64,8 @@ Container* createContainer(
         std::string& rootDir,
         std::string& command,
         ResourceLimits* resourceLimits,
-        bool buildImage)
+        bool buildImage,
+        bool isImage)
 {
 
     auto* container = new Container;
@@ -73,6 +74,7 @@ Container* createContainer(
     container->rootDir = rootDir;
     container->command = command;
     container->buildImage = buildImage;
+    container->isImage = isImage;
 
     // Retrieves the name of the current user
     char buffer[128];
@@ -95,36 +97,41 @@ Container* createContainer(
  * 1. Checks if the cache directory exists in the root directory. Creates it if it does not.
  * 2. Checks if the rootfs archive for the specified distro exists. Fetches it from the pre-defined
  * download URL if it is not present in the cache directory.
- * 3. If 'buildImage' is false and the 'rootfs' directory does not exist for the specified distro,
- * creates said directory and unpacks the file system of the distro in it. If 'buildImage' is true,
- * unpacks the file system into the container's directory in <root-dir>/containers/<container-id>/.
+ * 3. Extracts the rootfs archive to a specific location depending on 'buildImage' and 'isImage'.
+ *
  * Implementation based on https://github.com/Fewbytes/rubber-docker/blob/master/levels/10_setuid/rd.py
  */
 void setUpContainerImage(Container* container)
 {
-    std::string rootDir = container->rootDir;
-    std::string distroName = container->distroName;
-
-    std::string cacheDir = rootDir + "/cache/" + distroName;
+    const std::string rootDir = container->rootDir;
+    const std::string distroName = container->distroName;
+    const std::string cacheDir = rootDir + "/cache/";
+    const std::string cacheDistroDir = cacheDir + distroName;
 
     // Creates a cache directory to store the downloaded file systems if it does not exist
-    if (!std::filesystem::exists(cacheDir))
+    if (!std::filesystem::exists(cacheDistroDir))
     {
-        if (std::filesystem::create_directories(cacheDir))
-            std::cout << "Create cache directory " + cacheDir << ": SUCCESS" << std::endl;
+        if (std::filesystem::create_directories(cacheDistroDir))
+            std::cout << "Create cache directory " + cacheDistroDir << ": SUCCESS" << std::endl;
         else
-            throw std::runtime_error("Create cache directory " + cacheDir + ": FAILED");
+            throw std::runtime_error("Create cache directory " + cacheDistroDir + ": FAILED");
     }
 
 
-    std::string downloadUrl = stringToDownloadUrl[container->distroName];
+    const std::string downloadUrl = stringToDownloadUrl[container->distroName];
 
-    std::string baseArchiveName(basename(downloadUrl.c_str()));
-    std::string rootfsArchive = cacheDir + "/" + baseArchiveName;
+    const std::string baseArchiveName(basename(downloadUrl.c_str()));
+    std::string rootfsArchive;
+
+    if (container->isImage)
+        rootfsArchive = container->rootDir + "/images/" + container->id + ".tar.gz";
+    else
+        rootfsArchive = cacheDistroDir + "/" + baseArchiveName;
 
     char buffer[256];
 
     // Downloads the file system archive if it is not present in the cache directory
+    // If 'isImage' is set to true, 'rootfsArchive' always exists.p
     if (!std::filesystem::exists(rootfsArchive))
     {
         LOG_F(INFO, "Rootfs for %s does not exist", container->distroName.c_str());
@@ -134,9 +141,7 @@ void setUpContainerImage(Container* container)
             throw std::runtime_error("Download rootfs archive for " + distroName + ": FAILED");
     }
 
-    // Extracts the archive to the location depending on the value of 'buildImage'
-    // If 'buildImage' is true, extracts the file system to the container's directory.
-    // Otherwise, extracts the files to distro's directory.
+    // Extracts the archive to the location depending on the values of 'buildImage' and 'isImage'.
     std::string rootfsDestDir;
     if (container->buildImage)
     {
@@ -146,7 +151,10 @@ void setUpContainerImage(Container* container)
     }
     else
     {
-        rootfsDestDir = cacheDir + "/rootfs";
+        if (container->isImage)
+            rootfsDestDir = cacheDir + container->id;
+        else
+            rootfsDestDir = cacheDistroDir + "/rootfs";
     }
 
     // Creates the destination folder, and extracts the files
@@ -176,7 +184,6 @@ void setUpContainerImage(Container* container)
  */
 void setUpContainerOverlayFs(Container* container)
 {
-    char buffer[256];
     container->dir = container->rootDir + "/containers/" + container->id;
     std::string containerDir = container->dir;
 
@@ -546,7 +553,12 @@ void setUpNetworkNamespace(Container* container)
 void mountOverlayFileSystem(Container* container)
 {
     LOG_F(INFO, "Mounting overlay fs %s", container->rootfs.c_str());
-    std::string imageRootDir = container->rootDir + "/cache/" + container->distroName + "/rootfs";
+    std::string imageRootDir;
+    if (container->isImage)
+        imageRootDir = container->rootDir + "/cache/" + container->id;
+    else
+        imageRootDir = container->rootDir + "/cache/" + container->distroName + "/rootfs";
+
     std::string upperDir = container->dir + "/copy-on-write";
     std::string workDir = container->dir + "/work";
     std::string mountData = "lowerdir=" + imageRootDir + ",upperdir=" + upperDir + ",workdir=" + workDir;
@@ -734,7 +746,8 @@ bool enterContainment(Container* container)
         setUpDev(container);
         setUpVariables(container);
         // Adds DNS resolver to resolv.conf
-        appendToFile("/etc/resolv.conf", "nameserver " + DEFAULT_NAMESERVER);
+        if (!container->isImage)
+            appendToFile("/etc/resolv.conf", "nameserver " + DEFAULT_NAMESERVER);
         // Sets the new hostname to be the ID of the container
         sethostname(container->id.c_str(), container->id.length());
         // Blocks the current thread until network environment lization is finished
@@ -809,8 +822,8 @@ int execute(void* arg)
 
 /**
  * Starts a containerized process by invoking the clone() function.
- * The new namespaces created are: pid, uts, network, mount. Waits
- * for the cloned process to finish.
+ * The new namespaces created are: pid, uts, network, mount.
+ * Waits for the cloned process to finish.
  *
  * Implementations from:
  * - https://cesarvr.github.io/post/2018-05-22-create-containers/
@@ -866,7 +879,7 @@ void buildContainerImage(Container* container)
 
     std::string imageFilePath = imageDir + "/" + container->id + ".tar.gz";
     char buffer[256];
-    sprintf(buffer, "tar -czf %s -C %s .", imageFilePath.c_str(), container->rootfs.c_str());
+    sprintf(buffer, "tar --overwrite -czf %s -C %s .", imageFilePath.c_str(), container->rootfs.c_str());
     if (system(buffer) == -1)
         throw std::runtime_error("Build image for container: FAILED");
 
@@ -900,18 +913,26 @@ void removeCGroupDirs(Container* container)
 
 
 /**
- * Removes the directory that contains the file system of the given Container.
+ * Removes the directory that contains the file system of the given container.
+ * If the container that was run is based on a stored image and 'buildImage' is false,
+ * also removes its corresponding file directory in <root-dir>/cache/
+ * (i.e. lowerdir in the overlay fs).
  */
 void removeContainerDirectory(Container* container)
 {
     std::string containerDir = container->dir;
     LOG_F(INFO, "Removing %s", containerDir.c_str());
-    std::error_code errorCode;
-    if (!std::filesystem::remove_all(containerDir, errorCode))
+    if (!std::filesystem::remove_all(containerDir))
+        throw std::runtime_error("Remove directory " + containerDir + ": FAILED ");
+    if (!container->buildImage && container->isImage)
     {
-        throw std::runtime_error("Remove directory " + containerDir + ": FAILED " + errorCode.message());
+        std::string containerCacheDir = container->rootDir + "/cache/" + container->id;
+        LOG_F(INFO, "Removing %s", containerCacheDir.c_str());
+        if (!std::filesystem::remove_all(containerCacheDir))
+            throw std::runtime_error("Remove directory " + containerCacheDir + ": FAILED");
+        LOG_F(INFO, "Remove %s: SUCCESS", containerCacheDir.c_str());
     }
-    LOG_F(INFO, "Removing %s: SUCCESS", containerDir.c_str());
+    LOG_F(INFO, "Remove %s: SUCCESS", containerDir.c_str());
 }
 
 

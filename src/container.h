@@ -37,8 +37,12 @@ struct Image
  */
 struct Container
 {
+    // PID of the containerized process
     pid_t pid;
+    // Whether an image will be built after container exists
     bool buildImage;
+    // Whether the container to run comes from a saved local image
+    bool isImage;
     std::string distroName;
     std::string id;
     std::string rootDir;
@@ -59,7 +63,8 @@ Container* createContainer(std::string& distroName,
                            std::string& rootDir,
                            std::string& command,
                            ResourceLimits* resourceLimits,
-                           bool buildImage);
+                           bool buildImage,
+                           bool isImage);
 void startContainer(Container* container);
 
 #endif //CONTAINER_CPP_CONTAINER_H

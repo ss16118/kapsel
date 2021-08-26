@@ -22,8 +22,9 @@ std::map<std::string, CommandType> stringToCommandType = {
 
 
 /**
- * Fetches a list of container images from the directory <root-dir>/images/.
- * Returns the images as a vector of 'Image' structs, which contain the
+ * A helper function that fetches a list of container images from the
+ * directory <root-dir>/images/.
+ * @return the images as a vector of 'Image' structs, which contain the
  * relevant data.
  */
 std::vector<Image> getContainerImages(const std::string& rootDir)
@@ -43,21 +44,36 @@ std::vector<Image> getContainerImages(const std::string& rootDir)
     return images;
 }
 
+/**
+ * Checks if the image with the given ID exists.
+ * @return true if the image is already present, false otherwise.
+ */
+bool imageExists(const std::string& rootDir, const std::string& imageId)
+{
+    auto images = getContainerImages(rootDir);
+    return std::any_of(images.cbegin(), images.cend(),
+                       [imageId](const Image& image) { return image.id == imageId; });
+}
 
 
 /**
  * Executes the given command in a containerized environment as per the specified parameters.
- * If 'buildImage' is true, a
+ *
  */
 void run(std::string rootDir,
          std::string containerId,
-         std::string& distroName,
+         std::string distroName,
          std::string command,
          ResourceLimits* resourceLimits,
          bool buildImage)
 {
-    Container* container =
-            createContainer(distroName, containerId, rootDir, command, resourceLimits, buildImage);
+    bool isImage = imageExists(rootDir, containerId);
+
+    if (isImage)
+        std::cout << "Running image " << containerId << std::endl;
+
+    Container* container = createContainer(distroName, containerId, rootDir,
+                                           command, resourceLimits, buildImage, isImage);
     if (setUpContainer(container))
     {
         startContainer(container);
@@ -111,25 +127,30 @@ int main(int argc, char* argv[])
     // Sets up argument parsing
     cxxopts::Options options(argv[0], "Linux container implemented in C++");
     options.positional_help("[cmd-type] [args]").show_positional_help();
-    options.set_width(80).set_tab_expansion().add_options()
+    options.set_width(100).set_tab_expansion().add_options()
+            ("h,help", "Print arguments and their descriptions.")
             // Container parameters
             ("t,rootfs",
              R"(The root file system for the container. Current options are {"ubuntu", "alpine", "arch", "centos"}.)",
              cxxopts::value<std::string>()->default_value("ubuntu"))
-            ("i,container-id", "Specify the ID that will be given to the container.", cxxopts::value<std::string>())
+            ("i,container-id", "Specify the ID that of the container to run. "
+                               "If the ID points to a image which has been built, runs the image.",
+                               cxxopts::value<std::string>())
             ("r,root-dir", "The directory where all Kapsel related files will be stored.",
                     cxxopts::value<std::string>()->default_value("../res"))
             ("b,build", "Build an image of the container after exiting.")
 
             // Resource limits
-            ("p,process-number", R"(The maximum number of processes can be created in the container. Use "max" to remove limit.)",
-                    cxxopts::value<std::string>()->default_value("20"))
+            ("p,process-number", "The maximum number of processes can be created in the container. "
+                                 "Use 'max' to remove limit.",
+                                 cxxopts::value<std::string>()->default_value("20"))
             ("c,cpu-share", "The relative share of CPU time available for the container.",
                     cxxopts::value<int>()->default_value("512"))
             ("m,memory", "The user memory limit of the container. Use -1 to remove limit.",
                     cxxopts::value<std::string>()->default_value("256m"))
-            ("s,memory-swap", "The maximum amount for the sum of memory and swap usage in the container. Use -1 to remove limit.",
-                    cxxopts::value<std::string>()->default_value("512m"))
+            ("s,memory-swap", "The maximum amount for the sum of memory and swap usage in the container. "
+                              "Use -1 to remove limit.",
+                              cxxopts::value<std::string>()->default_value("512m"))
 
             // Logging
             ("l,logging", "Enable logging to a log file.")
@@ -145,8 +166,6 @@ int main(int argc, char* argv[])
                      "in the container; when <cmd-type> is 'delete', args will be a list of image IDs of the images"
                      "to be deleted.",
                      cxxopts::value<std::vector<std::string>>()->default_value(""))
-
-            ("h,help", "Print arguments and their descriptions.")
             ;
     options.parse_positional({"cmd-type", "args"});
 
@@ -201,6 +220,8 @@ int main(int argc, char* argv[])
             {
                 std::ostringstream command;
                 std::copy(args.begin(), args.end(), std::ostream_iterator<std::string>(command, " "));
+                if (command.str().empty())
+                    throw std::runtime_error("Command to run cannot be empty!");
                 run(rootDir, containerId, distroName, command.str(), resourceLimits,
                     parsedOptions["build"].as<bool>());
                 break;
