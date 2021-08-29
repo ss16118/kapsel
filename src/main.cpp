@@ -131,7 +131,7 @@ int main(int argc, char* argv[])
             ("h,help", "Print arguments and their descriptions.")
             // Container parameters
             ("t,rootfs",
-             R"(The root file system for the container. Current options are {"ubuntu", "alpine", "arch", "centos"}.)",
+             "The root file system for the container. Current options are {'ubuntu', 'alpine', 'arch', 'centos'}.",
              cxxopts::value<std::string>()->default_value("ubuntu"))
             ("i,container-id", "Specify the ID that of the container to run. "
                                "If the ID points to a image which has been built, runs the image.",
@@ -153,7 +153,7 @@ int main(int argc, char* argv[])
                               cxxopts::value<std::string>()->default_value("512m"))
 
             // Logging
-            ("l,logging", "Enable logging to a log file.")
+            ("l,logging", "Enable logging to log file <root-dir>/logs/<container-id>.log.")
 
             ("cmd-type", "Type of actions to perform. Available options are {'run', 'list', 'delete'}.\n"
                          "run   : executes the preceding command inside a container.\n"
@@ -163,7 +163,7 @@ int main(int argc, char* argv[])
 
             ("args", "The arguments that will passed to command type <cmd-type>. "
                      "For instance, when <cmd-type> is 'run', args will function as the command to be executed "
-                     "in the container; when <cmd-type> is 'delete', args will be a list of image IDs of the images"
+                     "in the container; when <cmd-type> is 'delete', args will be a list of image IDs of the images "
                      "to be deleted.",
                      cxxopts::value<std::vector<std::string>>()->default_value(""))
             ;

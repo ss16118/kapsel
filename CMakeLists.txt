@@ -12,5 +12,5 @@ set_target_properties(cxxopts PROPERTIES LINKER_LANGUAGE CXX)
 # loguru
 add_library(loguru STATIC libs/loguru/loguru.cpp libs/loguru/loguru.hpp)
 
-add_executable(kapsel src/main.cpp src/constants.h src/utils.cpp src/utils.h src/container.cpp src/container.h src/semaphore.h)
+add_executable(kapsel src/main.cpp src/constants.h src/utils.cpp src/utils.h src/container.cpp src/container.h)
 target_link_libraries(kapsel PRIVATE cxxopts loguru ${CMAKE_DL_LIBS})
